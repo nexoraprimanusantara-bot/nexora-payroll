@@ -233,6 +233,8 @@ const months = [
   "November",
   "Desember",
 ];
+const defaultStatusOptions = ["Tetap", "Training", "Freelance", "Part Time", "Kontrak", "Harian", "Magang"];
+const defaultPositionOptions = ["Admin", "Finance", "HR", "Sales", "Kasir", "Barista", "Kitchen", "Cook", "Server", "Supervisor", "Manager", "Driver", "Cleaning", "Security"];
 
 const now = () => new Date().toISOString();
 const uid = (prefix: string) => `${prefix}_${crypto.randomUUID()}`;
@@ -241,6 +243,21 @@ const today = () => new Date().toISOString().slice(0, 10);
 const currentTime = () => new Date().toTimeString().slice(0, 5);
 const monthStart = (month: number, year: number) => `${year}-${String(month).padStart(2, "0")}-01`;
 const monthEnd = (month: number, year: number) => new Date(year, month, 0).toISOString().slice(0, 10);
+const makeAttendanceToken = (employeeId: string) => `ATT-${employeeId}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+
+function nextEmployeeId(employees: Employee[]) {
+  const latest = employees
+    .map((employee) => /^EMP(\d+)$/i.exec(employee.employee_id)?.[1])
+    .filter(Boolean)
+    .map(Number)
+    .reduce((max, number) => Math.max(max, number), 0);
+  return `EMP${String(latest + 1).padStart(3, "0")}`;
+}
+
+function uniqueOptions(defaults: string[], savedValues: string[]) {
+  const saved = savedValues.map((value) => value.trim()).filter(Boolean);
+  return [...defaults, ...saved.filter((value) => !defaults.includes(value) && value !== "Custom"), "Custom"];
+}
 
 function formatIDR(amount: number, currency = "IDR") {
   return new Intl.NumberFormat("id-ID", {
@@ -526,7 +543,7 @@ function App() {
   const [store, setStore] = useState<Store>(() => loadStore());
   const [page, setPage] = useState("Absensi Staff");
   const [settingsTab, setSettingsTab] = useState("Info Bisnis");
-  const [draftEmployee, setDraftEmployee] = useState<Employee>(() => emptyEmployee());
+  const [draftEmployee, setDraftEmployee] = useState<Employee>(() => emptyEmployee(nextEmployeeId(store.employees)));
   const [selectedEmployeeId, setSelectedEmployeeId] = useState(store.employees[0]?.id || "");
   const [attendanceEmployeeId, setAttendanceEmployeeId] = useState("");
   const [attendanceSource, setAttendanceSource] = useState<"qr" | "manual">("manual");
@@ -590,15 +607,35 @@ function App() {
     setPage("Absensi Staff");
   };
 
-  const generateQr = async (employee: Employee) => {
-    const token = employee.attendance_token || employee.employee_id;
+  const ensureEmployeeToken = (employee: Employee) => {
+    if (employee.attendance_token) return employee;
+    const updated = { ...employee, attendance_token: makeAttendanceToken(employee.employee_id), updated_at: now() };
+    saveStore({ ...store, employees: store.employees.map((item) => item.id === employee.id ? updated : item) });
+    return updated;
+  };
+
+  const regenerateEmployeeToken = (employee: Employee) => {
+    const updated = { ...employee, attendance_token: makeAttendanceToken(employee.employee_id), updated_at: now() };
+    saveStore({ ...store, employees: store.employees.map((item) => item.id === employee.id ? updated : item) });
+    setQrMap((current) => {
+      const next = { ...current };
+      delete next[employee.id];
+      return next;
+    });
+    return updated;
+  };
+
+  const generateQr = async (employee: Employee, regenerate = false) => {
+    const secured = regenerate ? regenerateEmployeeToken(employee) : ensureEmployeeToken(employee);
+    const token = secured.attendance_token || secured.employee_id;
     const dataUrl = await QRCode.toDataURL(token, { margin: 1, width: 260 });
     setQrMap((current) => ({ ...current, [employee.id]: dataUrl }));
   };
 
   const downloadQr = async (employee: Employee, print = false) => {
-    const token = employee.attendance_token || employee.employee_id;
-    const dataUrl = qrMap[employee.id] || await QRCode.toDataURL(token, { margin: 1, width: 360 });
+    const secured = ensureEmployeeToken(employee);
+    const token = secured.attendance_token || secured.employee_id;
+    const dataUrl = qrMap[secured.id] || await QRCode.toDataURL(token, { margin: 1, width: 360 });
     if (print) {
       const popup = window.open("", "_blank");
       popup?.document.write(`<html><body style="font-family:Arial;text-align:center;padding:32px"><h2>${employee.name}</h2><p>${employee.employee_id}</p><img src="${dataUrl}" /></body></html>`);
@@ -773,6 +810,8 @@ function App() {
   const allDraftComponents = [...generatedComponents, ...customComponents];
   const totals = calculateTotals(allDraftComponents);
   const selectedSavedSlip = store.saved_payslips.find((slip) => slip.slip_id === selectedSlipId) || store.saved_payslips[0];
+  const statusOptions = uniqueOptions(defaultStatusOptions, store.employees.map((employee) => employee.status));
+  const positionOptions = uniqueOptions(defaultPositionOptions, store.employees.map((employee) => employee.position));
   const attendanceEmployee = store.employees.find((employee) => employee.employee_id === attendanceEmployeeId || employee.attendance_token === attendanceEmployeeId);
   const todayAttendance = attendanceEmployee
     ? store.attendance_logs.find((log) => log.employee_id === attendanceEmployee.employee_id && log.date === today())
@@ -795,16 +834,20 @@ function App() {
   };
 
   const saveEmployee = () => {
-    if (!draftEmployee.employee_id.trim() || !draftEmployee.name.trim()) return alert("Employee ID dan nama wajib diisi.");
+    if (!draftEmployee.name.trim()) return alert("Nama karyawan wajib diisi.");
     const exists = store.employees.some((employee) => employee.id === draftEmployee.id);
-    const nextEmployee = { ...draftEmployee, attendance_token: draftEmployee.attendance_token || draftEmployee.employee_id, updated_at: now() };
+    const employeeId = exists ? draftEmployee.employee_id : nextEmployeeId(store.employees);
+    const tokenExists = (token: string) => store.employees.some((employee) => employee.id !== draftEmployee.id && employee.attendance_token === token);
+    let token = draftEmployee.attendance_token || makeAttendanceToken(employeeId);
+    while (tokenExists(token)) token = makeAttendanceToken(employeeId);
+    const nextEmployee = { ...draftEmployee, employee_id: employeeId, attendance_token: token, updated_at: now() };
     saveStore({
       ...store,
       employees: exists
         ? store.employees.map((employee) => (employee.id === nextEmployee.id ? nextEmployee : employee))
         : [...store.employees, { ...nextEmployee, created_at: now() }],
     });
-    setDraftEmployee(emptyEmployee());
+    setDraftEmployee(emptyEmployee(nextEmployeeId(exists ? store.employees : [...store.employees, nextEmployee])));
     if (!selectedEmployeeId) setSelectedEmployeeId(nextEmployee.id);
   };
 
@@ -1144,32 +1187,47 @@ function App() {
             <div className="panel">
               <h2>Data Karyawan</h2>
               <div className="form-grid">
-                <Input label="Employee ID" value={draftEmployee.employee_id} onChange={(v) => setDraftEmployee({ ...draftEmployee, employee_id: v })} />
+                <label>ID Karyawan<input readOnly value={draftEmployee.employee_id} /><span className="helper-text">ID otomatis, tidak perlu diisi manual.</span><span className="helper-text">Employee ID dibuat otomatis oleh sistem.</span></label>
                 <Input label="Nama" value={draftEmployee.name} onChange={(v) => setDraftEmployee({ ...draftEmployee, name: v })} />
-                <Input label="Status" value={draftEmployee.status} onChange={(v) => setDraftEmployee({ ...draftEmployee, status: v })} />
-                <Input label="Posisi" value={draftEmployee.position} onChange={(v) => setDraftEmployee({ ...draftEmployee, position: v })} />
+                <label>Status Karyawan<select value={statusOptions.includes(draftEmployee.status) ? draftEmployee.status : "Custom"} onChange={(e) => setDraftEmployee({ ...draftEmployee, status: e.target.value === "Custom" ? "" : e.target.value })}>{statusOptions.map((option) => <option key={option} value={option}>{option}</option>)}</select></label>
+                {!statusOptions.includes(draftEmployee.status) && <Input label="Status custom" value={draftEmployee.status} onChange={(v) => setDraftEmployee({ ...draftEmployee, status: v })} />}
+                <label>Posisi<select value={positionOptions.includes(draftEmployee.position) ? draftEmployee.position : "Custom"} onChange={(e) => setDraftEmployee({ ...draftEmployee, position: e.target.value === "Custom" ? "" : e.target.value })}>{positionOptions.map((option) => <option key={option} value={option}>{option}</option>)}</select></label>
+                {!positionOptions.includes(draftEmployee.position) && <Input label="Posisi custom" value={draftEmployee.position} onChange={(v) => setDraftEmployee({ ...draftEmployee, position: v })} />}
                 <Input label="Gaji Default" type="number" value={draftEmployee.default_salary} onChange={(v) => setDraftEmployee({ ...draftEmployee, default_salary: cleanNumber(v) })} />
-                <Input label="Attendance Token / QR" value={draftEmployee.attendance_token} onChange={(v) => setDraftEmployee({ ...draftEmployee, attendance_token: v })} />
                 <Toggle label="Aktif" checked={draftEmployee.active} onChange={(v) => setDraftEmployee({ ...draftEmployee, active: v })} />
                 <label className="full">Catatan<textarea value={draftEmployee.notes} onChange={(e) => setDraftEmployee({ ...draftEmployee, notes: e.target.value })} /></label>
               </div>
               <button className="primary" onClick={saveEmployee}><Save size={16} /> Simpan Karyawan</button>
+              <div className="qr-info-card">
+                <h3>QR Absensi</h3>
+                <p>Token QR dibuat otomatis untuk absensi. QR ini digunakan staff untuk absensi. Staff tidak perlu mengisi token manual.</p>
+              </div>
             </div>
             <div className="panel">
               <h2>Daftar Karyawan</h2>
               <div className="list">
                 {store.employees.map((employee) => (
                   <div className="list-row" key={employee.id}>
-                    <div>
-                      <strong>{employee.name}</strong>
-                      <span>{employee.employee_id} | {employee.status} | {formatIDR(employee.default_salary, store.business_settings.currency)}</span>
-                      {qrMap[employee.id] && <img className="qr-preview" src={qrMap[employee.id]} alt="" />}
+                    <div className="employee-card-main">
+                      <div>
+                        <strong>{employee.employee_id} | {employee.name}</strong>
+                        <span>{employee.status} | {employee.position || "-"} | {formatIDR(employee.default_salary, store.business_settings.currency)}</span>
+                        <span className={`badge ${employee.active ? "active" : "inactive"}`}>{employee.active ? "Aktif" : "Nonaktif"}</span>
+                      </div>
+                      <div className="qr-section">
+                        <strong>QR Absensi</strong>
+                        <span>ID: {employee.employee_id}</span>
+                        <span className="helper-text">QR ini digunakan staff untuk absensi. Staff tidak perlu mengisi token manual.</span>
+                        {qrMap[employee.id] && <img className="qr-preview" src={qrMap[employee.id]} alt="" />}
+                      </div>
                     </div>
                     <div className="row-actions">
-                      <button className="icon" title="Generate QR" onClick={() => generateQr(employee)}><QrCode size={16} /></button>
+                      <button className="ghost" title="Edit" onClick={() => setDraftEmployee(employee)}><Pencil size={16} /> Edit</button>
+                      <button className="ghost" title="Generate / Regenerate QR" onClick={() => generateQr(employee, Boolean(employee.attendance_token))}><QrCode size={16} /> QR Absensi</button>
+                      <button className="icon" title="Preview QR" onClick={() => generateQr(employee)}><Eye size={16} /></button>
                       <button className="icon" title="Download QR" onClick={() => downloadQr(employee)}><Download size={16} /></button>
                       <button className="icon" title="Print QR" onClick={() => downloadQr(employee, true)}><Printer size={16} /></button>
-                      <button className="icon" title="Edit" onClick={() => setDraftEmployee(employee)}><Pencil size={16} /></button>
+                      <button className="danger" title="Deactivate" onClick={() => saveStore({ ...store, employees: store.employees.map((item) => item.id === employee.id ? { ...item, active: false, updated_at: now() } : item) })}>Deactivate</button>
                     </div>
                   </div>
                 ))}
@@ -1386,13 +1444,13 @@ function App() {
   );
 }
 
-function emptyEmployee(): Employee {
+function emptyEmployee(employeeId = "EMP001"): Employee {
   return {
     id: uid("employee"),
-    employee_id: "",
+    employee_id: employeeId,
     name: "",
     status: "Tetap",
-    position: "",
+    position: "Admin",
     active: true,
     default_salary: 0,
     attendance_token: "",
