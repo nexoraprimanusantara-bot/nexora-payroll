@@ -539,6 +539,36 @@ textarea {
   margin: 0;
 }
 
+.kiosk-qr-card {
+  display: grid;
+  place-items: center;
+  gap: 14px;
+  text-align: center;
+  padding: 20px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.kiosk-qr-frame {
+  display: grid;
+  width: min(420px, 100%);
+  aspect-ratio: 1;
+  place-items: center;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: white;
+}
+
+.kiosk-qr-frame img {
+  width: min(360px, 86vw);
+  height: min(360px, 86vw);
+}
+
+.kiosk-qr-card p {
+  margin: 0;
+}
+
 .attendance-methods,
 .big-actions {
   display: flex;
@@ -578,15 +608,6 @@ textarea {
   font-weight: 800;
 }
 
-.scanner-box {
-  width: min(420px, 100%);
-  min-height: 280px;
-  overflow: hidden;
-  border: 1px solid #cbd5e1;
-  border-radius: 8px;
-  background: #0f172a;
-}
-
 .manual-qr-box {
   display: grid;
   gap: 12px;
@@ -596,6 +617,14 @@ textarea {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.inner-panel {
+  display: grid;
+  gap: 14px;
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid #e2e8f0;
 }
 
 .confirm-card,

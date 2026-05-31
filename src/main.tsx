@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Archive,
@@ -54,6 +54,11 @@ type BusinessSettings = {
   admin_pin: string;
   attendance_qr_mode: "static" | "daily";
   office_qr_token: string;
+  location_validation_enabled: boolean;
+  office_latitude: number;
+  office_longitude: number;
+  location_radius_meters: number;
+  location_validation_mode: "warning" | "block";
   updated_at: string;
 };
 
@@ -179,6 +184,12 @@ type AttendanceLog = {
   qr_type?: "office_static" | "daily";
   qr_date?: string;
   pin_verified?: boolean;
+  location_lat?: number;
+  location_lng?: number;
+  location_accuracy?: number;
+  office_distance_meters?: number;
+  location_valid?: boolean;
+  location_validation_status?: "valid" | "outside_radius" | "denied" | "unavailable" | "not_configured";
   created_at: string;
   updated_at: string;
 };
@@ -268,12 +279,57 @@ const monthEnd = (month: number, year: number) => new Date(year, month, 0).toISO
 const makeAttendanceToken = (employeeId: string) => `ATT-${employeeId}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 const randomPin = () => String(Math.floor(1000 + Math.random() * 9000));
 const makeOfficeQrToken = () => `OFFICE-${crypto.randomUUID().slice(0, 12).toUpperCase()}`;
-const officeQrPayload = (settings: BusinessSettings, date = today()) =>
-  JSON.stringify({
-    type: settings.attendance_qr_mode === "daily" ? "daily" : "office_static",
-    token: settings.office_qr_token,
-    date: settings.attendance_qr_mode === "daily" ? date : "",
+const attendanceLink = (settings: BusinessSettings, date = today()) => {
+  const base = `${window.location.origin}${window.location.pathname}`;
+  const params = new URLSearchParams({
+    mode: "checkin",
+    officeToken: settings.office_qr_token,
+    qrType: settings.attendance_qr_mode === "daily" ? "daily" : "office_static",
   });
+  if (settings.attendance_qr_mode === "daily") params.set("qrDate", date);
+  return `${base}#/absensi-staff?${params.toString()}`;
+};
+
+const officeQrPayload = (settings: BusinessSettings, date = today()) => attendanceLink(settings, date);
+
+function readAttendanceParams() {
+  const query = window.location.hash.includes("?") ? window.location.hash.split("?")[1] : window.location.search.slice(1);
+  return new URLSearchParams(query || "");
+}
+
+function extractOfficeQr(raw: string) {
+  try {
+    const url = new URL(raw);
+    const query = url.hash.includes("?") ? url.hash.split("?")[1] : url.search.slice(1);
+    const params = new URLSearchParams(query);
+    return {
+      token: params.get("officeToken") || "",
+      type: params.get("qrType") || "office_static",
+      date: params.get("qrDate") || "",
+    };
+  } catch {
+    try {
+      const parsed = JSON.parse(raw) as { token?: string; type?: string; date?: string };
+      return { token: parsed.token || "", type: parsed.type || "office_static", date: parsed.date || "" };
+    } catch {
+      const params = new URLSearchParams(raw);
+      return {
+        token: params.get("officeToken") || raw.trim(),
+        type: params.get("qrType") || "office_static",
+        date: params.get("qrDate") || "",
+      };
+    }
+  }
+}
+
+function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number) {
+  const toRad = (value: number) => value * Math.PI / 180;
+  const earth = 6371000;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return earth * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
 
 type PayrollDraftRow = {
   employee_internal_id: string;
@@ -334,8 +390,13 @@ function defaultBusiness(): BusinessSettings {
     payment_note: "Pembayaran dilakukan sesuai tanggal yang tercantum.",
     currency: "IDR",
     admin_pin: "0987",
-    attendance_qr_mode: "daily",
+    attendance_qr_mode: "static",
     office_qr_token: makeOfficeQrToken(),
+    location_validation_enabled: false,
+    office_latitude: 0,
+    office_longitude: 0,
+    location_radius_meters: 100,
+    location_validation_mode: "warning",
     updated_at: now(),
   };
 }
@@ -427,8 +488,13 @@ function loadStore(): Store {
         ...seeded.business_settings,
         ...parsed.business_settings,
         admin_pin: parsed.business_settings?.admin_pin || "0987",
-        attendance_qr_mode: parsed.business_settings?.attendance_qr_mode || "daily",
+        attendance_qr_mode: parsed.business_settings?.attendance_qr_mode || "static",
         office_qr_token: parsed.business_settings?.office_qr_token || makeOfficeQrToken(),
+        location_validation_enabled: parsed.business_settings?.location_validation_enabled ?? false,
+        office_latitude: parsed.business_settings?.office_latitude ?? 0,
+        office_longitude: parsed.business_settings?.office_longitude ?? 0,
+        location_radius_meters: parsed.business_settings?.location_radius_meters ?? 100,
+        location_validation_mode: parsed.business_settings?.location_validation_mode || "warning",
       },
       employees: (parsed.employees || seeded.employees).map((employee: Employee) => ({
         ...employee,
@@ -454,6 +520,7 @@ function loadStore(): Store {
         qr_type: log.qr_type || (log.source === "qr" ? "daily" : undefined),
         qr_date: log.qr_date || log.date,
         pin_verified: log.pin_verified ?? log.source === "qr",
+        location_validation_status: log.location_validation_status || "not_configured",
       })),
       extra_work_records: parsed.extra_work_records || [],
       employee_cash_advances: parsed.employee_cash_advances || [],
@@ -761,14 +828,21 @@ function App() {
   const [draftEmployee, setDraftEmployee] = useState<Employee>(() => emptyEmployee(nextEmployeeId(store.employees)));
   const [selectedEmployeeId, setSelectedEmployeeId] = useState(store.employees[0]?.id || "");
   const [attendanceEmployeeId, setAttendanceEmployeeId] = useState("");
-  const [attendanceSource, setAttendanceSource] = useState<"qr" | "manual">("manual");
+  const [attendanceSource, setAttendanceSource] = useState<"qr" | "manual">("qr");
   const [attendanceQrInput, setAttendanceQrInput] = useState("");
   const [attendanceQrValid, setAttendanceQrValid] = useState(false);
   const [attendanceQrType, setAttendanceQrType] = useState<"office_static" | "daily">("daily");
-  const [scannerActive, setScannerActive] = useState(false);
-  const [scannerError, setScannerError] = useState("");
   const [showManualQr, setShowManualQr] = useState(false);
   const [adminCorrectionOpen, setAdminCorrectionOpen] = useState(false);
+  const [clockNow, setClockNow] = useState(new Date());
+  const [locationState, setLocationState] = useState<{
+    status: "valid" | "outside_radius" | "denied" | "unavailable" | "not_configured";
+    lat?: number;
+    lng?: number;
+    accuracy?: number;
+    distance?: number;
+    message: string;
+  }>({ status: "not_configured", message: "Validasi lokasi tidak aktif" });
   const [staffPinInput, setStaffPinInput] = useState("");
   const [manualAdminPin, setManualAdminPin] = useState("");
   const [officeQrDataUrl, setOfficeQrDataUrl] = useState("");
@@ -803,12 +877,26 @@ function App() {
   const [advancedQrEmployee, setAdvancedQrEmployee] = useState<Employee | null>(null);
   const [payrollRowsDraft, setPayrollRowsDraft] = useState<PayrollDraftRow[]>([]);
   const [detailRowId, setDetailRowId] = useState("");
-  const scannerRef = useRef<{ stop: () => Promise<unknown>; clear: () => void } | null>(null);
 
   const saveStore = (next: Store) => {
     setStore(next);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
   };
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setClockNow(new Date()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    QRCode.toDataURL(officeQrPayload(store.business_settings), { margin: 1, width: 420 }).then(setOfficeQrDataUrl);
+  }, [store.business_settings.office_qr_token, store.business_settings.attendance_qr_mode]);
+
+  useEffect(() => {
+    const params = readAttendanceParams();
+    const token = params.get("officeToken");
+    if (token) validateOfficeQr(window.location.href);
+  }, []);
 
   const requestPage = (target: string) => {
     if (target === "Absensi Staff" || adminUnlocked) {
@@ -838,12 +926,44 @@ function App() {
     setPage("Absensi Staff");
   };
 
+  const requestLocation = () => {
+    const settings = store.business_settings;
+    if (!settings.location_validation_enabled) {
+      setLocationState({ status: "not_configured", message: "Validasi lokasi tidak aktif" });
+      return;
+    }
+    if (!settings.office_latitude || !settings.office_longitude) {
+      setLocationState({ status: "not_configured", message: "Lokasi kantor belum diatur. Absensi tetap berjalan tanpa validasi lokasi." });
+      return;
+    }
+    if (!navigator.geolocation) {
+      setLocationState({ status: "unavailable", message: "Validasi lokasi tidak tersedia di perangkat ini." });
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const distance = haversineMeters(position.coords.latitude, position.coords.longitude, settings.office_latitude, settings.office_longitude);
+        const valid = distance <= (settings.location_radius_meters || 100);
+        setLocationState({
+          status: valid ? "valid" : "outside_radius",
+          lat: position.coords.latitude,
+          lng: position.coords.longitude,
+          accuracy: position.coords.accuracy,
+          distance,
+          message: valid ? "Lokasi valid" : "Lokasi di luar radius kantor",
+        });
+      },
+      () => setLocationState({ status: "denied", message: settings.location_validation_mode === "block" ? "Lokasi tidak dapat divalidasi. Aktifkan izin lokasi untuk absensi." : "Izin lokasi ditolak" }),
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 },
+    );
+  };
+
   const validateOfficeQr = (raw = attendanceQrInput) => {
+    const payload = extractOfficeQr(raw);
     try {
-      const payload = JSON.parse(raw) as { type?: string; token?: string; date?: string };
       if (payload.token !== store.business_settings.office_qr_token) {
         setAttendanceQrValid(false);
-        setAttendanceMessage("QR absensi tidak valid.");
+        setAttendanceMessage("QR kantor tidak valid. Silakan scan QR resmi dari kantor.");
         return false;
       }
       if (payload.type === "daily" && payload.date !== today()) {
@@ -854,51 +974,13 @@ function App() {
       setAttendanceQrValid(true);
       setAttendanceQrType(payload.type === "office_static" ? "office_static" : "daily");
       setAttendanceSource("qr");
-      setAttendanceMessage(payload.type === "daily" ? "QR hari ini valid." : "QR Absensi Kantor valid.");
+      setAttendanceMessage(payload.type === "daily" ? "QR hari ini valid." : "QR Kantor valid.");
+      requestLocation();
       return true;
     } catch {
       setAttendanceQrValid(false);
-      setAttendanceMessage("QR absensi tidak valid.");
+      setAttendanceMessage("QR kantor tidak valid. Silakan scan QR resmi dari kantor.");
       return false;
-    }
-  };
-
-  const stopScanner = async () => {
-    if (!scannerRef.current) return;
-    try {
-      await scannerRef.current.stop();
-      scannerRef.current.clear();
-    } catch {
-      // Camera may already be stopped by the browser.
-    }
-    scannerRef.current = null;
-    setScannerActive(false);
-  };
-
-  const startScanner = async () => {
-    setScannerError("");
-    setShowManualQr(false);
-    setAdminCorrectionOpen(false);
-    setScannerActive(true);
-    try {
-      const { Html5Qrcode } = await import("html5-qrcode");
-      await stopScanner();
-      const scanner = new Html5Qrcode("qr-reader");
-      scannerRef.current = scanner;
-      await scanner.start(
-        { facingMode: "environment" },
-        { fps: 10, qrbox: { width: 240, height: 240 } },
-        async (decodedText: string) => {
-          setAttendanceQrInput(decodedText);
-          validateOfficeQr(decodedText);
-          await stopScanner();
-        },
-        () => undefined,
-      );
-    } catch {
-      setScannerActive(false);
-      setShowManualQr(true);
-      setScannerError("Kamera tidak bisa dibuka. Gunakan Input Manual QR.");
     }
   };
 
@@ -924,6 +1006,23 @@ function App() {
     link.href = dataUrl;
     link.download = `qr-absensi-kantor-${store.business_settings.attendance_qr_mode === "daily" ? today() : "static"}.png`;
     link.click();
+  };
+
+  const copyAttendanceLink = async () => {
+    await navigator.clipboard.writeText(attendanceLink(store.business_settings));
+    setAttendanceMessage("Link absensi berhasil disalin.");
+  };
+
+  const setOfficeLocationFromDevice = () => {
+    if (!navigator.geolocation) return alert("Geolocation tidak tersedia di perangkat ini.");
+    navigator.geolocation.getCurrentPosition(
+      (position) => updateBusiness({
+        office_latitude: position.coords.latitude,
+        office_longitude: position.coords.longitude,
+      }),
+      () => alert("Izin lokasi ditolak. Tidak bisa menyimpan lokasi kantor."),
+      { enableHighAccuracy: true, timeout: 10000 },
+    );
   };
 
   const ensureEmployeeToken = (employee: Employee) => {
@@ -993,6 +1092,12 @@ function App() {
       qr_type: adminCorrectionOpen ? undefined : attendanceQrType,
       qr_date: adminCorrectionOpen ? "" : today(),
       pin_verified: attendanceEmployee.staff_pin === staffPinInput,
+      location_lat: locationState.lat,
+      location_lng: locationState.lng,
+      location_accuracy: locationState.accuracy,
+      office_distance_meters: locationState.distance,
+      location_valid: locationState.status === "valid" || locationState.status === "not_configured",
+      location_validation_status: locationState.status,
       created_at: now(),
       updated_at: now(),
     };
@@ -1172,7 +1277,8 @@ function App() {
     : undefined;
   const staffPinValid = Boolean(attendanceEmployee && staffPinInput && attendanceEmployee.staff_pin === staffPinInput);
   const attendanceCanContinue = attendanceQrValid || adminCorrectionOpen;
-  const attendanceReady = Boolean(attendanceCanContinue && attendanceEmployee?.active && staffPinValid);
+  const locationBlocksAttendance = store.business_settings.location_validation_enabled && store.business_settings.location_validation_mode === "block" && !["valid", "not_configured"].includes(locationState.status);
+  const attendanceReady = Boolean(attendanceCanContinue && attendanceEmployee?.active && staffPinValid && !locationBlocksAttendance);
   const activeKasbon = selectedEmployee
     ? store.employee_cash_advances.filter((kasbon) => kasbon.employee_id === selectedEmployee.employee_id && ["active", "partially_paid"].includes(kasbon.status) && kasbon.remaining_balance > 0)
     : [];
@@ -1632,19 +1738,35 @@ function App() {
           <section className="attendance-public">
             <div className="panel attendance-hero">
               <h2>Absensi Staff</h2>
-              <strong>{new Date().toLocaleString("id-ID", { dateStyle: "full", timeStyle: "short" })}</strong>
-              <div className="attendance-step">
-                <div className="step-title"><span>1</span><h3>Scan QR Absensi Kantor</h3></div>
-                <div className="attendance-methods">
-                  <button className="primary" onClick={startScanner}><QrCode size={18} /> Scan QR Absensi Kantor</button>
-                  <button className="ghost" onClick={() => setShowManualQr(!showManualQr)}>Input Manual QR</button>
-                  <button className="ghost" onClick={() => setAdminCorrectionOpen(!adminCorrectionOpen)}>Manual Admin Correction</button>
-                  <span className={`badge ${attendanceQrValid ? "active" : "inactive"}`}>{attendanceQrValid ? "QR valid" : "QR belum valid"}</span>
+              <strong>{clockNow.toLocaleString("id-ID", { dateStyle: "full", timeStyle: "short" })}</strong>
+              {!attendanceCanContinue && !showManualQr && !adminCorrectionOpen && (
+                <div className="kiosk-qr-card">
+                  <h3>QR Absensi Kantor</h3>
+                  <div className="kiosk-qr-frame">{officeQrDataUrl ? <img src={officeQrDataUrl} alt="" /> : <span>Memuat QR...</span>}</div>
+                  <p>Scan QR ini menggunakan HP staff untuk absen.</p>
+                  <span className="badge active">QR Kantor Aktif</span>
+                  <p className="muted">QR ini tidak perlu diganti setiap hari. Tanggal dan jam otomatis terdeteksi saat staff absen.</p>
+                  <div className="actions">
+                    <button className="ghost" onClick={() => generateOfficeQr(false)}><RotateCcw size={16} /> Refresh QR</button>
+                    <button className="ghost" onClick={() => downloadOfficeQr(false)}><Download size={16} /> Download QR</button>
+                    <button className="ghost" onClick={() => downloadOfficeQr(true)}><Printer size={16} /> Print QR</button>
+                    <button className="ghost" onClick={copyAttendanceLink}>Copy Link Absensi</button>
+                    <button className="ghost" onClick={() => setShowManualQr(true)}>Input Manual</button>
+                    <button className="ghost" onClick={() => setAdminCorrectionOpen(true)}>Manual Admin Correction</button>
+                  </div>
                 </div>
-                {scannerError && <p className="error-text">{scannerError}</p>}
-                {scannerActive && <div id="qr-reader" className="scanner-box" />}
+              )}
+              {(attendanceCanContinue || showManualQr || adminCorrectionOpen) && <div className="attendance-step">
+                <div className="step-title"><span>1</span><h3>Validasi QR Kantor</h3></div>
+                <div className="status-row">
+                  <span className={`badge ${attendanceQrValid ? "active" : "inactive"}`}>{attendanceQrValid ? "QR Kantor valid" : "QR kantor tidak valid"}</span>
+                  <span className={`badge ${locationState.status === "valid" || locationState.status === "not_configured" ? "active" : "pending"}`}>{locationState.message}</span>
+                </div>
+                <p className="muted">Tanggal Absensi: {today()} • Jam Sekarang: {clockNow.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" })}</p>
+                <p className="helper-text">Tanggal dan jam absensi otomatis mengikuti waktu saat staff clock in/out.</p>
                 {showManualQr && <div className="manual-qr-box">
-                  <label className="full">Input Manual QR<textarea placeholder="Gunakan ini hanya jika kamera tidak bisa digunakan." value={attendanceQrInput} onChange={(e) => setAttendanceQrInput(e.target.value)} /></label>
+                  <label className="full">Input Manual<textarea placeholder="Office token / attendance link" value={attendanceQrInput} onChange={(e) => setAttendanceQrInput(e.target.value)} /></label>
+                  <p className="helper-text">Gunakan hanya jika scan QR tidak bisa digunakan.</p>
                   <button className="primary" onClick={() => validateOfficeQr()}><QrCode size={16} /> Validasi QR</button>
                 </div>}
                 {adminCorrectionOpen && <div className="warning-card">
@@ -1652,7 +1774,7 @@ function App() {
                   <p className="muted">Khusus admin untuk koreksi darurat. Staff normal tidak perlu PIN admin.</p>
                   <input type="password" inputMode="numeric" placeholder="PIN Admin" value={manualAdminPin} onChange={(e) => setManualAdminPin(e.target.value)} />
                 </div>}
-              </div>
+              </div>}
               {attendanceCanContinue && <div className="attendance-step">
                 <div className="step-title"><span>2</span><h3>Pilih Staff</h3></div>
                 <div className="form-grid">
@@ -1981,24 +2103,38 @@ function App() {
                 <div className="section-head">
                   <div>
                     <h2>QR Absensi Kantor</h2>
-                    <p className="muted">Untuk mencegah titip absen, gunakan QR Harian + PIN Staff. QR harian berubah setiap hari dan PIN staff wajib diisi saat absen.</p>
+                    <p className="muted">Gunakan 1 QR kantor yang bisa diprint dan ditempel. Tanggal dan jam absensi akan otomatis mengikuti waktu saat staff scan.</p>
                   </div>
-                  <span className="badge active">{store.business_settings.attendance_qr_mode === "daily" ? "QR Harian" : "Static Office QR"}</span>
+                  <span className="badge active">{store.business_settings.attendance_qr_mode === "static" ? "Static Office QR" : "QR Harian"}</span>
                 </div>
                 <div className="form-grid">
-                  <label>QR Mode<select value={store.business_settings.attendance_qr_mode} onChange={(e) => updateBusiness({ attendance_qr_mode: e.target.value as "static" | "daily" })}><option value="daily">QR Harian</option><option value="static">Static Office QR</option></select></label>
+                  <label>QR Mode<select value={store.business_settings.attendance_qr_mode} onChange={(e) => updateBusiness({ attendance_qr_mode: e.target.value as "static" | "daily" })}><option value="static">Static Office QR, recommended</option><option value="daily">Daily QR, optional advanced</option></select></label>
                   <label>QR validity<input readOnly value={store.business_settings.attendance_qr_mode === "daily" ? "Valid today only" : "Static"} /></label>
                 </div>
                 <div className="actions">
-                  <button className="primary" onClick={() => generateOfficeQr(false)}><QrCode size={16} /> Generate QR</button>
-                  <button className="ghost" onClick={() => generateOfficeQr(true)}><RotateCcw size={16} /> Regenerate QR</button>
+                  <button className="primary" onClick={() => generateOfficeQr(false)}><QrCode size={16} /> Generate Office QR</button>
+                  <button className="ghost" onClick={() => generateOfficeQr(true)}><RotateCcw size={16} /> Regenerate Office QR</button>
                   <button className="ghost" onClick={() => downloadOfficeQr(false)}><Download size={16} /> Download QR</button>
                   <button className="ghost" onClick={() => downloadOfficeQr(true)}><Printer size={16} /> Print QR</button>
+                  <button className="ghost" onClick={copyAttendanceLink}>Copy Attendance Link</button>
                 </div>
                 <div className="office-qr-preview">
                   {officeQrDataUrl ? <img src={officeQrDataUrl} alt="" /> : <span>Office QR Code akan tampil setelah Generate QR.</span>}
                 </div>
-                <p className="helper-text">Rekomendasi: gunakan QR Harian Kantor + PIN Staff untuk mengurangi risiko titip absen.</p>
+                <p className="helper-text">Print atau tampilkan QR ini di tablet/laptop kantor. Staff scan QR menggunakan HP masing-masing, lalu pilih nama dan masukkan PIN Staff.</p>
+                <p className="helper-text">Mode QR Kantor Statis cocok untuk penggunaan harian. QR cukup diprint satu kali dan ditempel di kantor. Saat staff scan, sistem otomatis mencatat tanggal, jam, dan lokasi staff jika validasi lokasi diaktifkan.</p>
+                <div className="inner-panel">
+                  <h2>Validasi Lokasi</h2>
+                  <p className="muted">Validasi lokasi menggunakan izin lokasi dari browser HP staff. Akurasi dapat berbeda tergantung perangkat dan sinyal GPS.</p>
+                  <div className="form-grid">
+                    <Toggle label="Enable location validation" checked={store.business_settings.location_validation_enabled} onChange={(v) => updateBusiness({ location_validation_enabled: v })} />
+                    <label>Location validation mode<select value={store.business_settings.location_validation_mode} onChange={(e) => updateBusiness({ location_validation_mode: e.target.value as "warning" | "block" })}><option value="warning">Warning only</option><option value="block">Block attendance outside radius</option></select></label>
+                    <Input label="Office latitude" type="number" value={store.business_settings.office_latitude} onChange={(v) => updateBusiness({ office_latitude: cleanNumber(v) })} />
+                    <Input label="Office longitude" type="number" value={store.business_settings.office_longitude} onChange={(v) => updateBusiness({ office_longitude: cleanNumber(v) })} />
+                    <Input label="Allowed radius in meters" type="number" value={store.business_settings.location_radius_meters} onChange={(v) => updateBusiness({ location_radius_meters: cleanNumber(v) || 100 })} />
+                  </div>
+                  <button className="ghost" onClick={setOfficeLocationFromDevice}>Set Current Location as Office Location</button>
+                </div>
               </div>
             )}
             {settingsTab === "Komponen Payroll" && (
