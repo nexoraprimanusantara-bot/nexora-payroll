@@ -30,6 +30,17 @@ import {
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 import QRCode from "qrcode";
+import {
+  bootstrapData,
+  clockAttendanceRemote,
+  migrateLocalDataToNeon,
+  saveAttendanceSettings,
+  saveEmployeeRemote,
+  saveExtraWorkRemote,
+  syncStoreToRemote,
+  updateExtraWorkRemote,
+  validateOfficeQrRemote,
+} from "./services/dataStore";
 import "./styles.css";
 
 type ComponentType = "earning" | "deduction";
@@ -844,6 +855,7 @@ function App() {
   const [attendanceEmployeeId, setAttendanceEmployeeId] = useState("");
   const [attendanceSource, setAttendanceSource] = useState<"qr" | "manual">("qr");
   const [attendanceQrInput, setAttendanceQrInput] = useState("");
+  const [attendanceOfficeToken, setAttendanceOfficeToken] = useState("");
   const [attendanceQrValid, setAttendanceQrValid] = useState(false);
   const [attendanceQrType, setAttendanceQrType] = useState<"office_static" | "daily">("office_static");
   const [isCheckInMode, setIsCheckInMode] = useState(false);
@@ -893,14 +905,48 @@ function App() {
   const [advancedQrEmployee, setAdvancedQrEmployee] = useState<Employee | null>(null);
   const [payrollRowsDraft, setPayrollRowsDraft] = useState<PayrollDraftRow[]>([]);
   const [detailRowId, setDetailRowId] = useState("");
+  const [databaseOffline, setDatabaseOffline] = useState(false);
+  const [databaseMessage, setDatabaseMessage] = useState("");
 
-  const saveStore = (next: Store) => {
+  const saveStore = (next: Store, syncRemote = true) => {
     setStore(next);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    if (syncRemote) {
+      syncStoreToRemote(next as unknown as Record<string, unknown>).then((result) => {
+        setDatabaseOffline(!result.ok && result.offline);
+        if (!result.ok && result.offline) setDatabaseMessage("Database offline, menggunakan data lokal");
+      });
+    }
   };
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+  }, []);
+
+  useEffect(() => {
+    bootstrapData().then((result) => {
+      if (!result.ok) {
+        setDatabaseOffline(true);
+        setDatabaseMessage("Database offline, menggunakan data lokal");
+        return;
+      }
+      const data = result.data as Partial<Store>;
+      setDatabaseOffline(false);
+      setDatabaseMessage("");
+      setStore((current) => {
+        const next = {
+          ...current,
+          ...data,
+          business_settings: {
+            ...current.business_settings,
+            ...(data.business_settings || {}),
+          },
+          payroll_components: data.payroll_components?.length ? data.payroll_components : current.payroll_components,
+        } as Store;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+        return next;
+      });
+    });
   }, []);
 
   useEffect(() => {
@@ -972,13 +1018,36 @@ function App() {
     );
   };
 
-  const validateOfficeQr = (raw = attendanceQrInput) => {
+  const validateOfficeQr = async (raw = attendanceQrInput) => {
     setQrValidationAttempted(true);
     const payload = extractOfficeQr(raw);
     try {
-      if (payload.token !== store.business_settings.office_qr_token) {
+      if (!payload.token) {
         setAttendanceQrValid(false);
         setAttendanceMessage("QR kantor tidak valid. Silakan scan QR resmi dari kantor.");
+        return false;
+      }
+      const remote = await validateOfficeQrRemote(payload.token);
+      if (remote.ok) {
+        setDatabaseOffline(false);
+        setDatabaseMessage("");
+        if (!remote.data.valid) {
+          setAttendanceQrValid(false);
+          setAttendanceMessage("QR kantor tidak valid. Silakan scan QR resmi dari kantor.");
+          return false;
+        }
+        setAttendanceQrValid(true);
+        setAttendanceOfficeToken(payload.token);
+        setAttendanceQrType(remote.data.qr_type === "daily" ? "daily" : "office_static");
+        setAttendanceSource("qr");
+        setAttendanceMessage(remote.data.qr_type === "daily" ? "QR hari ini valid." : "QR Kantor valid.");
+        requestLocation();
+        return true;
+      }
+      setDatabaseOffline(remote.offline);
+      if (remote.offline && payload.token !== store.business_settings.office_qr_token) {
+        setAttendanceQrValid(false);
+        setAttendanceMessage("Database belum tersambung. Hubungi admin.");
         return false;
       }
       if (payload.type === "daily" && payload.date !== today()) {
@@ -987,6 +1056,7 @@ function App() {
         return false;
       }
       setAttendanceQrValid(true);
+      setAttendanceOfficeToken(payload.token);
       setAttendanceQrType(payload.type === "office_static" ? "office_static" : "daily");
       setAttendanceSource("qr");
       setAttendanceMessage(payload.type === "daily" ? "QR hari ini valid." : "QR Kantor valid.");
@@ -1029,10 +1099,20 @@ function App() {
   }, [store.business_settings.office_qr_token, store.business_settings.attendance_qr_mode]);
 
   const generateOfficeQr = async (regenerate = false) => {
-    const nextSettings = regenerate
+    let nextSettings = regenerate
       ? { ...store.business_settings, office_qr_token: makeOfficeQrToken(), updated_at: now() }
       : store.business_settings;
-    if (regenerate) saveStore({ ...store, business_settings: nextSettings });
+    if (regenerate) {
+      const remote = await saveAttendanceSettings(nextSettings as unknown as Record<string, unknown>, true);
+      if (remote.ok && remote.data.attendance_settings) {
+        nextSettings = { ...nextSettings, ...(remote.data.attendance_settings as Partial<BusinessSettings>) };
+        setDatabaseOffline(false);
+      } else if (!remote.ok && remote.offline) {
+        setDatabaseOffline(true);
+        setDatabaseMessage("Database offline, menggunakan data lokal");
+      }
+      saveStore({ ...store, business_settings: nextSettings }, !remote.ok);
+    }
     const dataUrl = await QRCode.toDataURL(officeQrPayload(nextSettings), { margin: 1, width: 320 });
     setOfficeQrDataUrl(dataUrl);
   };
@@ -1111,13 +1191,47 @@ function App() {
     link.click();
   };
 
-  const clockIn = () => {
+  const remoteLocationPayload = () => ({
+    lat: locationState.lat,
+    lng: locationState.lng,
+    accuracy: locationState.accuracy,
+    distance: locationState.distance,
+    valid: locationState.status === "valid" || locationState.status === "not_configured",
+    status: locationState.status,
+  });
+
+  const clockIn = async () => {
     if (!attendanceEmployee) return alert("Pilih atau masukkan Employee ID yang valid.");
     if (!attendanceEmployee.active) return alert("Karyawan tidak aktif.");
     if (!adminCorrectionOpen && !attendanceQrValid) return alert("Scan QR Absensi Kantor yang valid terlebih dahulu.");
     if (adminCorrectionOpen && manualAdminPin !== (store.business_settings.admin_pin || "0987")) return alert("Manual fallback memerlukan PIN admin.");
     if (attendanceEmployee.staff_pin !== staffPinInput) return alert("PIN Staff salah. Silakan coba lagi.");
     if (todayAttendance?.clock_in_time) return alert("Karyawan ini sudah clock in hari ini.");
+    if (!adminCorrectionOpen) {
+      const remote = await clockAttendanceRemote({
+        officeToken: attendanceOfficeToken || store.business_settings.office_qr_token,
+        employeeId: attendanceEmployee.employee_id,
+        staffPin: staffPinInput,
+        action: "clock_in",
+        date: today(),
+        time: currentTime(),
+        qrDate: today(),
+        location: remoteLocationPayload(),
+      });
+      if (remote.ok) {
+        const log = remote.data.attendance as AttendanceLog;
+        setDatabaseOffline(false);
+        saveStore({ ...store, attendance_logs: [log, ...store.attendance_logs.filter((item) => item.id !== log.id)] }, false);
+        setAttendanceMessage(String(remote.data.message || `Clock In berhasil pukul ${log.clock_in_time}`));
+        return;
+      }
+      if (!remote.offline) {
+        setAttendanceMessage(remote.error);
+        return;
+      }
+      setDatabaseOffline(true);
+      setDatabaseMessage("Database offline, menggunakan data lokal");
+    }
     const log: AttendanceLog = {
       id: uid("attendance"),
       employee_id: attendanceEmployee.employee_id,
@@ -1149,13 +1263,41 @@ function App() {
     setAttendanceMessage(`Clock In berhasil pukul ${log.clock_in_time}`);
   };
 
-  const clockOut = () => {
+  const clockOut = async () => {
     if (!attendanceEmployee || !todayAttendance) return alert("Clock in terlebih dahulu.");
     if (!adminCorrectionOpen && !attendanceQrValid) return alert("Scan QR Absensi Kantor yang valid terlebih dahulu.");
     if (adminCorrectionOpen && manualAdminPin !== (store.business_settings.admin_pin || "0987")) return alert("Manual fallback memerlukan PIN admin.");
     if (attendanceEmployee.staff_pin !== staffPinInput) return alert("PIN Staff salah. Silakan coba lagi.");
     if (todayAttendance.clock_out_time) return alert("Karyawan ini sudah clock out hari ini.");
     const out = currentTime();
+    if (!adminCorrectionOpen) {
+      const remote = await clockAttendanceRemote({
+        officeToken: attendanceOfficeToken || store.business_settings.office_qr_token,
+        employeeId: attendanceEmployee.employee_id,
+        staffPin: staffPinInput,
+        action: "clock_out",
+        date: today(),
+        time: out,
+        location: remoteLocationPayload(),
+      });
+      if (remote.ok) {
+        const log = remote.data.attendance as AttendanceLog;
+        setDatabaseOffline(false);
+        saveStore({
+          ...store,
+          attendance_logs: [log, ...store.attendance_logs.filter((item) => item.id !== log.id)],
+        }, false);
+        setAttendanceMessage(String(remote.data.message || `Clock Out berhasil pukul ${log.clock_out_time}`));
+        setShowExtraPrompt(attendanceEmployee);
+        return;
+      }
+      if (!remote.offline) {
+        setAttendanceMessage(remote.error);
+        return;
+      }
+      setDatabaseOffline(true);
+      setDatabaseMessage("Database offline, menggunakan data lokal");
+    }
     const total = timeDiffMinutes(todayAttendance.date, todayAttendance.clock_in_time, out);
     const overtime = Math.max(0, total - 8 * 60);
     saveStore({
@@ -1222,6 +1364,10 @@ function App() {
     }
     if (!records.length) return;
     saveStore({ ...store, extra_work_records: [...records, ...store.extra_work_records] });
+    saveExtraWorkRemote(records as unknown as Array<Record<string, unknown>>).then((result) => {
+      setDatabaseOffline(!result.ok && result.offline);
+      if (!result.ok && result.offline) setDatabaseMessage("Database offline, menggunakan data lokal");
+    });
     setShowExtraPrompt(null);
     setExtraChoice("none");
     setExtraDraft({ overtime_hours: 0, overtime_amount: 0, overtime_notes: "", chore_name: "", chore_quantity: 0, chore_amount: 0, chore_notes: "" });
@@ -1229,11 +1375,16 @@ function App() {
   };
 
   const setExtraStatus = (record: ExtraWorkRecord, status: ApprovalStatus) => {
+    const updated = { ...record, status, approved_by: status === "approved" ? "Admin" : "", approved_at: status === "approved" ? now() : "", updated_at: now() };
     saveStore({
       ...store,
       extra_work_records: store.extra_work_records.map((item) =>
-        item.id === record.id ? { ...item, status, approved_by: status === "approved" ? "Admin" : "", approved_at: status === "approved" ? now() : "", updated_at: now() } : item,
+        item.id === record.id ? updated : item,
       ),
+    });
+    updateExtraWorkRemote(updated as unknown as Record<string, unknown>).then((result) => {
+      setDatabaseOffline(!result.ok && result.offline);
+      if (!result.ok && result.offline) setDatabaseMessage("Database offline, menggunakan data lokal");
     });
   };
 
@@ -1338,7 +1489,12 @@ function App() {
     : [];
 
   const updateBusiness = (patch: Partial<BusinessSettings>) => {
-    saveStore({ ...store, business_settings: { ...store.business_settings, ...patch, updated_at: now() } });
+    const nextSettings = { ...store.business_settings, ...patch, updated_at: now() };
+    saveStore({ ...store, business_settings: nextSettings });
+    saveAttendanceSettings(nextSettings as unknown as Record<string, unknown>).then((result) => {
+      setDatabaseOffline(!result.ok && result.offline);
+      if (!result.ok && result.offline) setDatabaseMessage("Database offline, menggunakan data lokal");
+    });
   };
 
   const saveEmployee = () => {
@@ -1361,6 +1517,10 @@ function App() {
       employees: exists
         ? store.employees.map((employee) => (employee.id === nextEmployee.id ? nextEmployee : employee))
         : [...store.employees, { ...nextEmployee, created_at: now() }],
+    });
+    saveEmployeeRemote(nextEmployee as unknown as Record<string, unknown>).then((result) => {
+      setDatabaseOffline(!result.ok && result.offline);
+      if (!result.ok && result.offline) setDatabaseMessage("Database offline, menggunakan data lokal");
     });
     setDraftEmployee(emptyEmployee(nextEmployeeId(exists ? store.employees : [...store.employees, nextEmployee])));
     if (!selectedEmployeeId) setSelectedEmployeeId(nextEmployee.id);
@@ -1614,6 +1774,20 @@ function App() {
     saveStore(JSON.parse(await file.text()));
   };
 
+  const migrateLocalData = async () => {
+    const result = await migrateLocalDataToNeon(store as unknown as Record<string, unknown>);
+    if (!result.ok) {
+      setDatabaseOffline(result.offline);
+      setDatabaseMessage(result.offline ? "Database offline, menggunakan data lokal" : result.error);
+      alert(result.offline ? "Database belum tersambung. Cek DATABASE_URL di Vercel/Neon." : result.error);
+      return;
+    }
+    setDatabaseOffline(false);
+    setDatabaseMessage("");
+    const summary = result.data.summary || {};
+    alert(`Migrasi selesai. Karyawan: ${summary.employees || 0}, absensi: ${summary.attendance || 0}, lembur/extra chore: ${summary.extraWork || 0}.`);
+  };
+
   const filteredSlips = store.saved_payslips.filter((slip) => {
     const matchSearch = slip.employee_name.toLowerCase().includes(historySearch.toLowerCase());
     const matchMonth = !historyMonth || slip.month === Number(historyMonth);
@@ -1657,6 +1831,7 @@ function App() {
             <h1>{page}</h1>
           </div>
           <div className="top-actions">
+            {adminUnlocked && databaseOffline && <span className="badge pending">{databaseMessage || "Database offline, menggunakan data lokal"}</span>}
             {adminUnlocked && <button className="ghost" onClick={lockAdmin}><Lock size={16} /> Lock Admin</button>}
             <button className="ghost" onClick={exportBackup}><Download size={16} /> Backup</button>
             <label className="ghost file-button"><Upload size={16} /> Impor <input type="file" accept="application/json" onChange={(e) => importBackup(e.target.files?.[0])} /></label>
@@ -2132,7 +2307,7 @@ function App() {
         {adminUnlocked && page === "Settings" && (
           <section className="settings-layout">
             <div className="tabs">
-              {["Info Bisnis", "Absensi Settings", "Komponen Payroll", "Pengaturan PDF"].map((tab) => <button key={tab} className={settingsTab === tab ? "active" : ""} onClick={() => setSettingsTab(tab)}>{tab}</button>)}
+              {["Info Bisnis", "Absensi Settings", "Komponen Payroll", "Pengaturan PDF", "Data"].map((tab) => <button key={tab} className={settingsTab === tab ? "active" : ""} onClick={() => setSettingsTab(tab)}>{tab}</button>)}
             </div>
             {settingsTab === "Info Bisnis" && (
               <div className="panel">
@@ -2212,6 +2387,22 @@ function App() {
                   <label className="full">Catatan Pembayaran Default<textarea value={store.business_settings.payment_note} onChange={(e) => updateBusiness({ payment_note: e.target.value })} /></label>
                   <p className="helper-text full">PIN Admin disimpan internal dan tidak ditampilkan di UI. Perubahan PIN admin akan dibuat melalui panel keamanan terpisah.</p>
                 </div>
+              </div>
+            )}
+            {settingsTab === "Data" && (
+              <div className="panel">
+                <div className="section-head">
+                  <div>
+                    <h2>Data</h2>
+                    <p className="muted">Sinkronkan data lokal ke Neon agar QR kantor, staff, absensi, kasbon, payroll, dan slip tersimpan lintas perangkat.</p>
+                  </div>
+                  <span className={`badge ${databaseOffline ? "pending" : "active"}`}>{databaseOffline ? "Database offline" : "Database siap / fallback aktif"}</span>
+                </div>
+                <div className="actions">
+                  <button className="primary" onClick={migrateLocalData}><Upload size={16} /> Migrate Local Data to Neon</button>
+                  <button className="ghost" onClick={exportBackup}><Download size={16} /> Backup Lokal</button>
+                </div>
+                <p className="helper-text">Jika DATABASE_URL belum tersedia, aplikasi tetap menggunakan localStorage. Setelah DATABASE_URL dipasang di Vercel, jalankan migrasi ini satu kali dari perangkat admin.</p>
               </div>
             )}
           </section>
