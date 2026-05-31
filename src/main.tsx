@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Archive,
@@ -194,6 +194,7 @@ type ExtraWorkRecord = {
   amount: number;
   notes: string;
   status: ApprovalStatus;
+  source?: "staff_after_clock_out" | "admin_manual";
   approved_by: string;
   approved_at: string;
   created_at: string;
@@ -764,12 +765,17 @@ function App() {
   const [attendanceQrInput, setAttendanceQrInput] = useState("");
   const [attendanceQrValid, setAttendanceQrValid] = useState(false);
   const [attendanceQrType, setAttendanceQrType] = useState<"office_static" | "daily">("daily");
+  const [scannerActive, setScannerActive] = useState(false);
+  const [scannerError, setScannerError] = useState("");
+  const [showManualQr, setShowManualQr] = useState(false);
+  const [adminCorrectionOpen, setAdminCorrectionOpen] = useState(false);
   const [staffPinInput, setStaffPinInput] = useState("");
   const [manualAdminPin, setManualAdminPin] = useState("");
   const [officeQrDataUrl, setOfficeQrDataUrl] = useState("");
   const [attendanceMessage, setAttendanceMessage] = useState("");
   const [showExtraPrompt, setShowExtraPrompt] = useState<Employee | null>(null);
-  const [extraDraft, setExtraDraft] = useState({ type: "overtime" as ExtraWorkType, hours: 0, quantity: 0, amount: 0, notes: "" });
+  const [extraChoice, setExtraChoice] = useState<"none" | "overtime" | "extra_chore" | "both">("none");
+  const [extraDraft, setExtraDraft] = useState({ overtime_hours: 0, overtime_amount: 0, overtime_notes: "", chore_name: "", chore_quantity: 0, chore_amount: 0, chore_notes: "" });
   const [recapFrom, setRecapFrom] = useState(monthStart(new Date().getMonth() + 1, new Date().getFullYear()));
   const [recapTo, setRecapTo] = useState(today());
   const [recapEmployee, setRecapEmployee] = useState("");
@@ -797,6 +803,7 @@ function App() {
   const [advancedQrEmployee, setAdvancedQrEmployee] = useState<Employee | null>(null);
   const [payrollRowsDraft, setPayrollRowsDraft] = useState<PayrollDraftRow[]>([]);
   const [detailRowId, setDetailRowId] = useState("");
+  const scannerRef = useRef<{ stop: () => Promise<unknown>; clear: () => void } | null>(null);
 
   const saveStore = (next: Store) => {
     setStore(next);
@@ -853,6 +860,45 @@ function App() {
       setAttendanceQrValid(false);
       setAttendanceMessage("QR absensi tidak valid.");
       return false;
+    }
+  };
+
+  const stopScanner = async () => {
+    if (!scannerRef.current) return;
+    try {
+      await scannerRef.current.stop();
+      scannerRef.current.clear();
+    } catch {
+      // Camera may already be stopped by the browser.
+    }
+    scannerRef.current = null;
+    setScannerActive(false);
+  };
+
+  const startScanner = async () => {
+    setScannerError("");
+    setShowManualQr(false);
+    setAdminCorrectionOpen(false);
+    setScannerActive(true);
+    try {
+      const { Html5Qrcode } = await import("html5-qrcode");
+      await stopScanner();
+      const scanner = new Html5Qrcode("qr-reader");
+      scannerRef.current = scanner;
+      await scanner.start(
+        { facingMode: "environment" },
+        { fps: 10, qrbox: { width: 240, height: 240 } },
+        async (decodedText: string) => {
+          setAttendanceQrInput(decodedText);
+          validateOfficeQr(decodedText);
+          await stopScanner();
+        },
+        () => undefined,
+      );
+    } catch {
+      setScannerActive(false);
+      setShowManualQr(true);
+      setScannerError("Kamera tidak bisa dibuka. Gunakan Input Manual QR.");
     }
   };
 
@@ -925,8 +971,8 @@ function App() {
   const clockIn = () => {
     if (!attendanceEmployee) return alert("Pilih atau masukkan Employee ID yang valid.");
     if (!attendanceEmployee.active) return alert("Karyawan tidak aktif.");
-    if (attendanceSource === "qr" && !attendanceQrValid) return alert("Scan QR Absensi Kantor yang valid terlebih dahulu.");
-    if (attendanceSource === "manual" && manualAdminPin !== (store.business_settings.admin_pin || "0987")) return alert("Manual fallback memerlukan PIN admin.");
+    if (!adminCorrectionOpen && !attendanceQrValid) return alert("Scan QR Absensi Kantor yang valid terlebih dahulu.");
+    if (adminCorrectionOpen && manualAdminPin !== (store.business_settings.admin_pin || "0987")) return alert("Manual fallback memerlukan PIN admin.");
     if (attendanceEmployee.staff_pin !== staffPinInput) return alert("PIN Staff salah. Silakan coba lagi.");
     if (todayAttendance?.clock_in_time) return alert("Karyawan ini sudah clock in hari ini.");
     const log: AttendanceLog = {
@@ -943,21 +989,21 @@ function App() {
       overtime_minutes: 0,
       status: currentTime() > "09:00" ? "telat" : "hadir",
       notes: "",
-      source: attendanceSource,
-      qr_type: attendanceSource === "qr" ? attendanceQrType : undefined,
-      qr_date: attendanceSource === "qr" ? today() : "",
+      source: adminCorrectionOpen ? "manual" : "qr",
+      qr_type: adminCorrectionOpen ? undefined : attendanceQrType,
+      qr_date: adminCorrectionOpen ? "" : today(),
       pin_verified: attendanceEmployee.staff_pin === staffPinInput,
       created_at: now(),
       updated_at: now(),
     };
     saveStore({ ...store, attendance_logs: [log, ...store.attendance_logs] });
-    setAttendanceMessage(`Clock in berhasil: ${attendanceEmployee.name} pukul ${log.clock_in_time}.`);
+    setAttendanceMessage(`Clock In berhasil pukul ${log.clock_in_time}`);
   };
 
   const clockOut = () => {
     if (!attendanceEmployee || !todayAttendance) return alert("Clock in terlebih dahulu.");
-    if (attendanceSource === "qr" && !attendanceQrValid) return alert("Scan QR Absensi Kantor yang valid terlebih dahulu.");
-    if (attendanceSource === "manual" && manualAdminPin !== (store.business_settings.admin_pin || "0987")) return alert("Manual fallback memerlukan PIN admin.");
+    if (!adminCorrectionOpen && !attendanceQrValid) return alert("Scan QR Absensi Kantor yang valid terlebih dahulu.");
+    if (adminCorrectionOpen && manualAdminPin !== (store.business_settings.admin_pin || "0987")) return alert("Manual fallback memerlukan PIN admin.");
     if (attendanceEmployee.staff_pin !== staffPinInput) return alert("PIN Staff salah. Silakan coba lagi.");
     if (todayAttendance.clock_out_time) return alert("Karyawan ini sudah clock out hari ini.");
     const out = currentTime();
@@ -969,7 +1015,7 @@ function App() {
         log.id === todayAttendance.id ? { ...log, clock_out_time: out, total_work_minutes: total, overtime_minutes: overtime, pin_verified: true, updated_at: now() } : log,
       ),
     });
-    setAttendanceMessage(`Clock out berhasil: ${attendanceEmployee.name} pukul ${out}.`);
+    setAttendanceMessage(`Clock Out berhasil pukul ${out}`);
     setShowExtraPrompt(attendanceEmployee);
   };
 
@@ -986,26 +1032,51 @@ function App() {
       setShowExtraPrompt(null);
       return;
     }
-    const record: ExtraWorkRecord = {
-      id: uid("extra_work"),
-      employee_id: showExtraPrompt.employee_id,
-      employee_name: showExtraPrompt.name,
-      date: today(),
-      type: extraDraft.type,
-      hours: cleanNumber(extraDraft.hours),
-      quantity: cleanNumber(extraDraft.quantity),
-      amount: cleanNumber(extraDraft.amount),
-      notes: extraDraft.notes,
-      status: "pending",
-      approved_by: "",
-      approved_at: "",
-      created_at: now(),
-      updated_at: now(),
-    };
-    saveStore({ ...store, extra_work_records: [record, ...store.extra_work_records] });
+    const records: ExtraWorkRecord[] = [];
+    if (extraChoice === "overtime" || extraChoice === "both") {
+      records.push({
+        id: uid("extra_work"),
+        employee_id: showExtraPrompt.employee_id,
+        employee_name: showExtraPrompt.name,
+        date: today(),
+        type: "overtime",
+        hours: cleanNumber(extraDraft.overtime_hours),
+        quantity: 0,
+        amount: cleanNumber(extraDraft.overtime_amount),
+        notes: extraDraft.overtime_notes,
+        status: "pending",
+        source: "staff_after_clock_out",
+        approved_by: "",
+        approved_at: "",
+        created_at: now(),
+        updated_at: now(),
+      });
+    }
+    if (extraChoice === "extra_chore" || extraChoice === "both") {
+      records.push({
+        id: uid("extra_work"),
+        employee_id: showExtraPrompt.employee_id,
+        employee_name: showExtraPrompt.name,
+        date: today(),
+        type: "extra_chore",
+        hours: 0,
+        quantity: cleanNumber(extraDraft.chore_quantity),
+        amount: cleanNumber(extraDraft.chore_amount),
+        notes: [extraDraft.chore_name, extraDraft.chore_notes].filter(Boolean).join(" - "),
+        status: "pending",
+        source: "staff_after_clock_out",
+        approved_by: "",
+        approved_at: "",
+        created_at: now(),
+        updated_at: now(),
+      });
+    }
+    if (!records.length) return;
+    saveStore({ ...store, extra_work_records: [...records, ...store.extra_work_records] });
     setShowExtraPrompt(null);
-    setExtraDraft({ type: "overtime", hours: 0, quantity: 0, amount: 0, notes: "" });
-    setAttendanceMessage("Pengajuan lembur / extra chore berhasil dikirim dan menunggu approval.");
+    setExtraChoice("none");
+    setExtraDraft({ overtime_hours: 0, overtime_amount: 0, overtime_notes: "", chore_name: "", chore_quantity: 0, chore_amount: 0, chore_notes: "" });
+    setAttendanceMessage("Pengajuan lembur / extra chore berhasil dikirim dan menunggu approval admin.");
   };
 
   const setExtraStatus = (record: ExtraWorkRecord, status: ApprovalStatus) => {
@@ -1099,6 +1170,9 @@ function App() {
   const todayAttendance = attendanceEmployee
     ? store.attendance_logs.find((log) => log.employee_id === attendanceEmployee.employee_id && log.date === today())
     : undefined;
+  const staffPinValid = Boolean(attendanceEmployee && staffPinInput && attendanceEmployee.staff_pin === staffPinInput);
+  const attendanceCanContinue = attendanceQrValid || adminCorrectionOpen;
+  const attendanceReady = Boolean(attendanceCanContinue && attendanceEmployee?.active && staffPinValid);
   const activeKasbon = selectedEmployee
     ? store.employee_cash_advances.filter((kasbon) => kasbon.employee_id === selectedEmployee.employee_id && ["active", "partially_paid"].includes(kasbon.status) && kasbon.remaining_balance > 0)
     : [];
@@ -1457,20 +1531,26 @@ function App() {
           <div className="modal-backdrop">
             <div className="modal-card wide-modal">
               <h2>Ada lembur / extra chore hari ini?</h2>
-              <p className="muted">{showExtraPrompt.name} baru saja clock out. Pengajuan akan masuk status pending sampai admin approve.</p>
+              <p className="muted">{showExtraPrompt.name} baru saja Clock Out. Pengajuan akan masuk status pending sampai admin approve.</p>
               <div className="actions">
                 <button className="ghost" onClick={() => submitExtraWork(true)}>Tidak ada</button>
-                <button className={extraDraft.type === "overtime" ? "primary" : "ghost"} onClick={() => setExtraDraft({ ...extraDraft, type: "overtime" })}>Ada lembur</button>
-                <button className={extraDraft.type === "extra_chore" ? "primary" : "ghost"} onClick={() => setExtraDraft({ ...extraDraft, type: "extra_chore" })}>Ada extra chore</button>
+                <button className={extraChoice === "overtime" ? "primary" : "ghost"} onClick={() => setExtraChoice("overtime")}>Ada Lembur</button>
+                <button className={extraChoice === "extra_chore" ? "primary" : "ghost"} onClick={() => setExtraChoice("extra_chore")}>Ada Extra Chore</button>
+                <button className={extraChoice === "both" ? "primary" : "ghost"} onClick={() => setExtraChoice("both")}>Ada Lembur + Extra Chore</button>
               </div>
-              <div className="form-grid">
-                <Input label="Jam" type="number" value={extraDraft.hours} onChange={(v) => setExtraDraft({ ...extraDraft, hours: cleanNumber(v) })} />
-                <Input label="Quantity" type="number" value={extraDraft.quantity} onChange={(v) => setExtraDraft({ ...extraDraft, quantity: cleanNumber(v) })} />
-                <Input label="Amount" type="number" value={extraDraft.amount} onChange={(v) => setExtraDraft({ ...extraDraft, amount: cleanNumber(v) })} />
-                <Input label="Catatan" value={extraDraft.notes} onChange={(v) => setExtraDraft({ ...extraDraft, notes: v })} />
-              </div>
+              {(extraChoice === "overtime" || extraChoice === "both") && <div className="form-grid">
+                <Input label="Jam Lembur" type="number" value={extraDraft.overtime_hours} onChange={(v) => setExtraDraft({ ...extraDraft, overtime_hours: cleanNumber(v) })} />
+                <Input label="Nominal Lembur" type="number" value={extraDraft.overtime_amount} onChange={(v) => setExtraDraft({ ...extraDraft, overtime_amount: cleanNumber(v) })} />
+                <Input label="Catatan Lembur" value={extraDraft.overtime_notes} onChange={(v) => setExtraDraft({ ...extraDraft, overtime_notes: v })} />
+              </div>}
+              {(extraChoice === "extra_chore" || extraChoice === "both") && <div className="form-grid">
+                <Input label="Nama Chore / Tugas Tambahan" value={extraDraft.chore_name} onChange={(v) => setExtraDraft({ ...extraDraft, chore_name: v })} />
+                <Input label="Qty" type="number" value={extraDraft.chore_quantity} onChange={(v) => setExtraDraft({ ...extraDraft, chore_quantity: cleanNumber(v) })} />
+                <Input label="Nominal" type="number" value={extraDraft.chore_amount} onChange={(v) => setExtraDraft({ ...extraDraft, chore_amount: cleanNumber(v) })} />
+                <Input label="Catatan" value={extraDraft.chore_notes} onChange={(v) => setExtraDraft({ ...extraDraft, chore_notes: v })} />
+              </div>}
               <div className="actions">
-                <button className="primary" onClick={() => submitExtraWork(false)}><Save size={16} /> Kirim Pengajuan</button>
+                <button className="primary" disabled={extraChoice === "none"} onClick={() => submitExtraWork(false)}><Save size={16} /> Kirim untuk Approval Admin</button>
                 <button className="ghost" onClick={() => setShowExtraPrompt(null)}>Tutup</button>
               </div>
             </div>
@@ -1553,39 +1633,55 @@ function App() {
             <div className="panel attendance-hero">
               <h2>Absensi Staff</h2>
               <strong>{new Date().toLocaleString("id-ID", { dateStyle: "full", timeStyle: "short" })}</strong>
-              <div className="attendance-methods">
-                <button className={attendanceSource === "qr" ? "primary" : "ghost"} onClick={() => setAttendanceSource("qr")}><QrCode size={18} /> Scan QR Absensi Kantor</button>
-                <button className={attendanceSource === "manual" ? "primary" : "ghost"} onClick={() => setAttendanceSource("manual")}><Users size={18} /> Input Manual</button>
-              </div>
-              {attendanceSource === "qr" && (
-                <div className="form-grid">
-                  <label className="full">QR Absensi Kantor<textarea placeholder="Tempel hasil scan QR Absensi Kantor / QR Harian" value={attendanceQrInput} onChange={(e) => setAttendanceQrInput(e.target.value)} /></label>
+              <div className="attendance-step">
+                <div className="step-title"><span>1</span><h3>Scan QR Absensi Kantor</h3></div>
+                <div className="attendance-methods">
+                  <button className="primary" onClick={startScanner}><QrCode size={18} /> Scan QR Absensi Kantor</button>
+                  <button className="ghost" onClick={() => setShowManualQr(!showManualQr)}>Input Manual QR</button>
+                  <button className="ghost" onClick={() => setAdminCorrectionOpen(!adminCorrectionOpen)}>Manual Admin Correction</button>
+                  <span className={`badge ${attendanceQrValid ? "active" : "inactive"}`}>{attendanceQrValid ? "QR valid" : "QR belum valid"}</span>
+                </div>
+                {scannerError && <p className="error-text">{scannerError}</p>}
+                {scannerActive && <div id="qr-reader" className="scanner-box" />}
+                {showManualQr && <div className="manual-qr-box">
+                  <label className="full">Input Manual QR<textarea placeholder="Gunakan ini hanya jika kamera tidak bisa digunakan." value={attendanceQrInput} onChange={(e) => setAttendanceQrInput(e.target.value)} /></label>
                   <button className="primary" onClick={() => validateOfficeQr()}><QrCode size={16} /> Validasi QR</button>
-                  <span className={`badge ${attendanceQrValid ? "active" : "inactive"}`}>{attendanceQrValid ? "QR hari ini valid" : "QR belum valid"}</span>
-                </div>
-              )}
-              {attendanceSource === "manual" && (
-                <div className="warning-card">
-                  <strong>Input Manual</strong>
-                  <p className="muted">Fallback manual hanya untuk admin/emergency dan memerlukan PIN admin.</p>
+                </div>}
+                {adminCorrectionOpen && <div className="warning-card">
+                  <strong>Manual Admin Correction</strong>
+                  <p className="muted">Khusus admin untuk koreksi darurat. Staff normal tidak perlu PIN admin.</p>
                   <input type="password" inputMode="numeric" placeholder="PIN Admin" value={manualAdminPin} onChange={(e) => setManualAdminPin(e.target.value)} />
-                </div>
-              )}
-              {(attendanceQrValid || attendanceSource === "manual") && <div className="form-grid">
-                <Input label="ID Karyawan" value={attendanceEmployeeId} onChange={setAttendanceEmployeeId} />
-                <label>Pilih Staff<select value={attendanceEmployee?.id || ""} onChange={(e) => {
-                  const employee = store.employees.find((item) => item.id === e.target.value);
-                  setAttendanceEmployeeId(employee?.employee_id || "");
-                }}><option value="">Pilih fallback manual</option>{store.employees.filter((e) => e.active).map((employee) => <option key={employee.id} value={employee.id}>{employee.employee_id} - {employee.name}</option>)}</select></label>
-                <label>PIN Staff<input type="password" inputMode="numeric" placeholder="Masukkan PIN Staff" value={staffPinInput} onChange={(e) => setStaffPinInput(e.target.value)} /></label>
-              </div>}
-              {attendanceEmployee && <div className="confirm-card"><strong>{attendanceEmployee.name}</strong><span>{attendanceEmployee.employee_id} | {attendanceEmployee.status}</span></div>}
-              <div className="big-actions">
-                <button className="primary" onClick={clockIn}><Clock size={22} /> Clock In</button>
-                <button className="primary dark" onClick={clockOut}><Check size={22} /> Clock Out</button>
-                <button className="ghost" onClick={() => updateTodayBreak("break_start_time")}>Break Start</button>
-                <button className="ghost" onClick={() => updateTodayBreak("break_end_time")}>Break End</button>
+                </div>}
               </div>
+              {attendanceCanContinue && <div className="attendance-step">
+                <div className="step-title"><span>2</span><h3>Pilih Staff</h3></div>
+                <div className="form-grid">
+                  <label>Pilih Nama Staff<select value={attendanceEmployee?.id || ""} onChange={(e) => {
+                    const employee = store.employees.find((item) => item.id === e.target.value);
+                    setAttendanceEmployeeId(employee?.employee_id || "");
+                  }}><option value="">Pilih staff terlebih dahulu</option>{store.employees.filter((e) => e.active).map((employee) => <option key={employee.id} value={employee.id}>{employee.employee_id} - {employee.name}</option>)}</select></label>
+                  <Input label="Atau masukkan Employee ID" value={attendanceEmployeeId} onChange={setAttendanceEmployeeId} />
+                </div>
+                {attendanceEmployee && <div className="confirm-card"><strong>{attendanceEmployee.name}</strong><span>{attendanceEmployee.employee_id} | {attendanceEmployee.status} | {attendanceEmployee.position}</span></div>}
+              </div>}
+              {attendanceCanContinue && attendanceEmployee && <div className="attendance-step">
+                <div className="step-title"><span>3</span><h3>Masukkan PIN Staff</h3></div>
+                <div className="form-grid">
+                  <label>PIN Staff<input type="password" inputMode="numeric" placeholder="Masukkan PIN Staff" value={staffPinInput} onChange={(e) => setStaffPinInput(e.target.value)} /></label>
+                  <span className={`badge ${staffPinValid ? "active" : "inactive"}`}>{staffPinValid ? "PIN Staff valid" : "PIN Staff belum valid"}</span>
+                </div>
+              </div>}
+              {attendanceCanContinue && attendanceEmployee && <div className="attendance-step">
+                <div className="step-title"><span>4</span><h3>Absen</h3></div>
+                <div className="status-row">
+                  {todayAttendance?.clock_in_time && <span className="badge pending">Sudah Clock In</span>}
+                  {todayAttendance?.clock_out_time && <span className="badge approved">Sudah Clock Out</span>}
+                </div>
+                <div className="big-actions">
+                  <button className="primary" disabled={!attendanceReady || Boolean(todayAttendance?.clock_in_time)} onClick={clockIn}><Clock size={22} /> Clock In</button>
+                  <button className="primary dark" disabled={!attendanceReady || !todayAttendance?.clock_in_time || Boolean(todayAttendance?.clock_out_time)} onClick={clockOut}><Check size={22} /> Clock Out</button>
+                </div>
+              </div>}
               {attendanceMessage && <p className="success-text">{attendanceMessage}</p>}
               {todayAttendance && <div className="today-status">
                 <span>Clock in <strong>{todayAttendance.clock_in_time || "-"}</strong></span>
@@ -1596,7 +1692,7 @@ function App() {
             </div>
             <div className="panel">
               <h2>Ringkasan Absensi Hari Ini</h2>
-              <AttendanceTable logs={store.attendance_logs.filter((log) => log.date === today())} editable={false} onUpdate={() => undefined} />
+              <AttendanceTable logs={store.attendance_logs.filter((log) => log.date === today())} editable={false} onUpdate={() => undefined} extraWork={store.extra_work_records} />
             </div>
           </section>
         )}
@@ -1809,7 +1905,7 @@ function App() {
               <button className="primary" onClick={() => {
                 const employee = selectedEmployee || store.employees[0];
                 if (!employee) return;
-                const record: ExtraWorkRecord = { id: uid("extra_work"), employee_id: employee.employee_id, employee_name: employee.name, date: today(), type: "overtime", hours: 0, quantity: 0, amount: 0, notes: "Input manual admin", status: "pending", approved_by: "", approved_at: "", created_at: now(), updated_at: now() };
+                const record: ExtraWorkRecord = { id: uid("extra_work"), employee_id: employee.employee_id, employee_name: employee.name, date: today(), type: "overtime", hours: 0, quantity: 0, amount: 0, notes: "Input manual admin", status: "pending", source: "admin_manual", approved_by: "", approved_at: "", created_at: now(), updated_at: now() };
                 saveStore({ ...store, extra_work_records: [record, ...store.extra_work_records] });
               }}><Plus size={16} /> Buat Manual</button>
             </div>
@@ -2039,23 +2135,25 @@ function AttendanceStats({ logs }: { logs: AttendanceLog[] }) {
   );
 }
 
-function AttendanceTable(props: { logs: AttendanceLog[]; editable: boolean; onUpdate: (log: AttendanceLog, patch: Partial<AttendanceLog>) => void }) {
+function AttendanceTable(props: { logs: AttendanceLog[]; editable: boolean; onUpdate: (log: AttendanceLog, patch: Partial<AttendanceLog>) => void; extraWork?: ExtraWorkRecord[] }) {
   if (!props.logs.length) return <Empty title="Belum ada data absensi." />;
   return (
     <div className="table-wrap">
       <table>
-        <thead><tr><th>Karyawan</th><th>Tanggal</th><th>Clock In</th><th>Clock Out</th><th>Total</th><th>Status</th><th>Catatan</th></tr></thead>
-        <tbody>{props.logs.map((log) => (
-          <tr key={log.id}>
+        <thead><tr><th>Karyawan</th><th>Tanggal</th><th>Clock In</th><th>Clock Out</th><th>Total</th><th>Status</th><th>Pending</th><th>Catatan</th></tr></thead>
+        <tbody>{props.logs.map((log) => {
+          const pending = (props.extraWork || []).filter((record) => record.employee_id === log.employee_id && record.date === log.date && record.status === "pending").length;
+          return <tr key={log.id}>
             <td>{log.employee_name}<span className="muted">{log.employee_id} | {log.source}</span></td>
             <td>{log.date}</td>
             <td>{log.clock_in_time || "-"}</td>
             <td>{log.clock_out_time || "-"}</td>
             <td>{Math.round(log.total_work_minutes / 60 * 10) / 10} jam</td>
             <td>{props.editable ? <select value={log.status} onChange={(e) => props.onUpdate(log, { status: e.target.value as AttendanceStatus })}>{attendanceStatusOptions.map((status) => <option key={status} value={status}>{statusLabel(status)}</option>)}</select> : statusLabel(log.status)}</td>
+            <td>{pending ? <span className="badge pending">{pending} pending</span> : "-"}</td>
             <td>{props.editable ? <input value={log.notes} onChange={(e) => props.onUpdate(log, { notes: e.target.value })} /> : log.notes || "-"}</td>
-          </tr>
-        ))}</tbody>
+          </tr>;
+        })}</tbody>
       </table>
     </div>
   );
