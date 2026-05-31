@@ -292,15 +292,28 @@ const attendanceLink = (settings: BusinessSettings, date = today()) => {
 
 const officeQrPayload = (settings: BusinessSettings, date = today()) => attendanceLink(settings, date);
 
+function getQueryParam(name: string) {
+  const direct = new URLSearchParams(window.location.search).get(name);
+  if (direct) return direct;
+  const hash = window.location.hash || "";
+  if (!hash.includes("?")) return null;
+  const hashQuery = hash.slice(hash.indexOf("?") + 1);
+  return new URLSearchParams(hashQuery).get(name);
+}
+
 function readAttendanceParams() {
-  const query = window.location.hash.includes("?") ? window.location.hash.split("?")[1] : window.location.search.slice(1);
-  return new URLSearchParams(query || "");
+  return {
+    mode: getQueryParam("mode") || "",
+    officeToken: getQueryParam("officeToken") || "",
+    qrType: getQueryParam("qrType") || "office_static",
+    qrDate: getQueryParam("qrDate") || "",
+  };
 }
 
 function extractOfficeQr(raw: string) {
   try {
     const url = new URL(raw);
-    const query = url.hash.includes("?") ? url.hash.split("?")[1] : url.search.slice(1);
+    const query = url.search || (url.hash.includes("?") ? url.hash.slice(url.hash.indexOf("?")) : "");
     const params = new URLSearchParams(query);
     return {
       token: params.get("officeToken") || "",
@@ -312,7 +325,8 @@ function extractOfficeQr(raw: string) {
       const parsed = JSON.parse(raw) as { token?: string; type?: string; date?: string };
       return { token: parsed.token || "", type: parsed.type || "office_static", date: parsed.date || "" };
     } catch {
-      const params = new URLSearchParams(raw);
+      const queryText = raw.includes("?") ? raw.slice(raw.indexOf("?") + 1) : raw;
+      const params = new URLSearchParams(queryText);
       return {
         token: params.get("officeToken") || raw.trim(),
         type: params.get("qrType") || "office_static",
@@ -831,7 +845,9 @@ function App() {
   const [attendanceSource, setAttendanceSource] = useState<"qr" | "manual">("qr");
   const [attendanceQrInput, setAttendanceQrInput] = useState("");
   const [attendanceQrValid, setAttendanceQrValid] = useState(false);
-  const [attendanceQrType, setAttendanceQrType] = useState<"office_static" | "daily">("daily");
+  const [attendanceQrType, setAttendanceQrType] = useState<"office_static" | "daily">("office_static");
+  const [isCheckInMode, setIsCheckInMode] = useState(false);
+  const [qrValidationAttempted, setQrValidationAttempted] = useState(false);
   const [showManualQr, setShowManualQr] = useState(false);
   const [adminCorrectionOpen, setAdminCorrectionOpen] = useState(false);
   const [clockNow, setClockNow] = useState(new Date());
@@ -884,6 +900,10 @@ function App() {
   };
 
   useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+  }, []);
+
+  useEffect(() => {
     const timer = window.setInterval(() => setClockNow(new Date()), 1000);
     return () => window.clearInterval(timer);
   }, []);
@@ -891,12 +911,6 @@ function App() {
   useEffect(() => {
     QRCode.toDataURL(officeQrPayload(store.business_settings), { margin: 1, width: 420 }).then(setOfficeQrDataUrl);
   }, [store.business_settings.office_qr_token, store.business_settings.attendance_qr_mode]);
-
-  useEffect(() => {
-    const params = readAttendanceParams();
-    const token = params.get("officeToken");
-    if (token) validateOfficeQr(window.location.href);
-  }, []);
 
   const requestPage = (target: string) => {
     if (target === "Absensi Staff" || adminUnlocked) {
@@ -959,6 +973,7 @@ function App() {
   };
 
   const validateOfficeQr = (raw = attendanceQrInput) => {
+    setQrValidationAttempted(true);
     const payload = extractOfficeQr(raw);
     try {
       if (payload.token !== store.business_settings.office_qr_token) {
@@ -983,6 +998,35 @@ function App() {
       return false;
     }
   };
+
+  useEffect(() => {
+    const handleAttendanceRoute = () => {
+      const params = readAttendanceParams();
+      if (params.mode !== "checkin") {
+        setIsCheckInMode(false);
+        setQrValidationAttempted(false);
+        setAttendanceQrValid(false);
+        return;
+      }
+      setIsCheckInMode(true);
+      setShowManualQr(false);
+      setAdminCorrectionOpen(false);
+      if (params.officeToken) {
+        validateOfficeQr(window.location.href);
+        return;
+      }
+      setQrValidationAttempted(true);
+      setAttendanceQrValid(false);
+      setAttendanceMessage("QR kantor tidak valid. Silakan scan QR resmi dari kantor.");
+    };
+    handleAttendanceRoute();
+    window.addEventListener("hashchange", handleAttendanceRoute);
+    window.addEventListener("popstate", handleAttendanceRoute);
+    return () => {
+      window.removeEventListener("hashchange", handleAttendanceRoute);
+      window.removeEventListener("popstate", handleAttendanceRoute);
+    };
+  }, [store.business_settings.office_qr_token, store.business_settings.attendance_qr_mode]);
 
   const generateOfficeQr = async (regenerate = false) => {
     const nextSettings = regenerate
@@ -1279,6 +1323,7 @@ function App() {
   const attendanceCanContinue = attendanceQrValid || adminCorrectionOpen;
   const locationBlocksAttendance = store.business_settings.location_validation_enabled && store.business_settings.location_validation_mode === "block" && !["valid", "not_configured"].includes(locationState.status);
   const attendanceReady = Boolean(attendanceCanContinue && attendanceEmployee?.active && staffPinValid && !locationBlocksAttendance);
+  const attendanceMessageIsError = attendanceMessage.includes("tidak valid") || attendanceMessage.includes("tidak berlaku") || attendanceMessage.includes("salah");
   const activeKasbon = selectedEmployee
     ? store.employee_cash_advances.filter((kasbon) => kasbon.employee_id === selectedEmployee.employee_id && ["active", "partially_paid"].includes(kasbon.status) && kasbon.remaining_balance > 0)
     : [];
@@ -1739,7 +1784,7 @@ function App() {
             <div className="panel attendance-hero">
               <h2>Absensi Staff</h2>
               <strong>{clockNow.toLocaleString("id-ID", { dateStyle: "full", timeStyle: "short" })}</strong>
-              {!attendanceCanContinue && !showManualQr && !adminCorrectionOpen && (
+              {!isCheckInMode && !attendanceCanContinue && !showManualQr && !adminCorrectionOpen && (
                 <div className="kiosk-qr-card">
                   <h3>QR Absensi Kantor</h3>
                   <div className="kiosk-qr-frame">{officeQrDataUrl ? <img src={officeQrDataUrl} alt="" /> : <span>Memuat QR...</span>}</div>
@@ -1754,6 +1799,13 @@ function App() {
                     <button className="ghost" onClick={() => setShowManualQr(true)}>Input Manual</button>
                     <button className="ghost" onClick={() => setAdminCorrectionOpen(true)}>Manual Admin Correction</button>
                   </div>
+                </div>
+              )}
+              {isCheckInMode && qrValidationAttempted && !attendanceQrValid && !showManualQr && !adminCorrectionOpen && (
+                <div className="attendance-step invalid-qr-card">
+                  <div className="step-title"><span>1</span><h3>Validasi QR Kantor</h3></div>
+                  <span className="badge inactive">QR kantor tidak valid</span>
+                  <p className="error-text">QR kantor tidak valid. Silakan scan QR resmi dari kantor.</p>
                 </div>
               )}
               {(attendanceCanContinue || showManualQr || adminCorrectionOpen) && <div className="attendance-step">
@@ -1804,7 +1856,7 @@ function App() {
                   <button className="primary dark" disabled={!attendanceReady || !todayAttendance?.clock_in_time || Boolean(todayAttendance?.clock_out_time)} onClick={clockOut}><Check size={22} /> Clock Out</button>
                 </div>
               </div>}
-              {attendanceMessage && <p className="success-text">{attendanceMessage}</p>}
+              {attendanceMessage && !(isCheckInMode && qrValidationAttempted && !attendanceQrValid && !showManualQr && !adminCorrectionOpen) && <p className={attendanceMessageIsError ? "error-text" : "success-text"}>{attendanceMessage}</p>}
               {todayAttendance && <div className="today-status">
                 <span>Clock in <strong>{todayAttendance.clock_in_time || "-"}</strong></span>
                 <span>Clock out <strong>{todayAttendance.clock_out_time || "-"}</strong></span>
@@ -2110,6 +2162,7 @@ function App() {
                 <div className="form-grid">
                   <label>QR Mode<select value={store.business_settings.attendance_qr_mode} onChange={(e) => updateBusiness({ attendance_qr_mode: e.target.value as "static" | "daily" })}><option value="static">Static Office QR, recommended</option><option value="daily">Daily QR, optional advanced</option></select></label>
                   <label>QR validity<input readOnly value={store.business_settings.attendance_qr_mode === "daily" ? "Valid today only" : "Static"} /></label>
+                  <label>Office token<input readOnly type="password" value={store.business_settings.office_qr_token ? "••••••••••••" : ""} /></label>
                 </div>
                 <div className="actions">
                   <button className="primary" onClick={() => generateOfficeQr(false)}><QrCode size={16} /> Generate Office QR</button>
@@ -2121,6 +2174,7 @@ function App() {
                 <div className="office-qr-preview">
                   {officeQrDataUrl ? <img src={officeQrDataUrl} alt="" /> : <span>Office QR Code akan tampil setelah Generate QR.</span>}
                 </div>
+                <p className="warning-text">Jika QR diregenerasi, QR lama yang sudah diprint tidak akan berlaku.</p>
                 <p className="helper-text">Print atau tampilkan QR ini di tablet/laptop kantor. Staff scan QR menggunakan HP masing-masing, lalu pilih nama dan masukkan PIN Staff.</p>
                 <p className="helper-text">Mode QR Kantor Statis cocok untuk penggunaan harian. QR cukup diprint satu kali dan ditempel di kantor. Saat staff scan, sistem otomatis mencatat tanggal, jam, dan lokasi staff jika validasi lokasi diaktifkan.</p>
                 <div className="inner-panel">
