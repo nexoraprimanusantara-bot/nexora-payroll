@@ -34,7 +34,7 @@ import "./styles.css";
 
 type ComponentType = "earning" | "deduction";
 type RowStatus = "Draft" | "Finalized" | "Paid";
-type AttendanceStatus = "hadir" | "telat" | "izin" | "sakit" | "alfa" | "libur";
+type AttendanceStatus = "hadir" | "telat" | "cuti_berbayar" | "cuti_tidak_berbayar" | "izin" | "sakit" | "alfa" | "libur";
 type ExtraWorkType = "overtime" | "extra_chore";
 type ApprovalStatus = "pending" | "approved" | "rejected";
 type KasbonStatus = "active" | "partially_paid" | "paid" | "cancelled";
@@ -52,6 +52,8 @@ type BusinessSettings = {
   payment_note: string;
   currency: string;
   admin_pin: string;
+  attendance_qr_mode: "static" | "daily";
+  office_qr_token: string;
   updated_at: string;
 };
 
@@ -67,6 +69,7 @@ type PayrollComponent = {
   company_paid: boolean;
   employee_deduction: boolean;
   notes: string;
+  category?: "Default Staff" | "Monthly Variable" | "Deduction" | "Allowance";
   sort_order: number;
   archived?: boolean;
   created_at: string;
@@ -81,6 +84,21 @@ type Employee = {
   position: string;
   active: boolean;
   default_salary: number;
+  base_salary_monthly: number;
+  meal_allowance_per_day: number;
+  transport_allowance_per_day: number;
+  work_days_per_month: number;
+  leave_quota_monthly: number;
+  leave_quota_yearly: number;
+  bpjs_kesehatan_default: number;
+  bpjs_ketenagakerjaan_default: number;
+  fixed_allowance: number;
+  hp_admin_allowance_enabled: boolean;
+  hp_admin_allowance_amount: number;
+  bank_name: string;
+  account_number: string;
+  account_holder: string;
+  staff_pin: string;
   attendance_token: string;
   notes: string;
   created_at: string;
@@ -158,6 +176,9 @@ type AttendanceLog = {
   status: AttendanceStatus;
   notes: string;
   source: "qr" | "manual";
+  qr_type?: "office_static" | "daily";
+  qr_date?: string;
+  pin_verified?: boolean;
   created_at: string;
   updated_at: string;
 };
@@ -244,6 +265,37 @@ const currentTime = () => new Date().toTimeString().slice(0, 5);
 const monthStart = (month: number, year: number) => `${year}-${String(month).padStart(2, "0")}-01`;
 const monthEnd = (month: number, year: number) => new Date(year, month, 0).toISOString().slice(0, 10);
 const makeAttendanceToken = (employeeId: string) => `ATT-${employeeId}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+const randomPin = () => String(Math.floor(1000 + Math.random() * 9000));
+const makeOfficeQrToken = () => `OFFICE-${crypto.randomUUID().slice(0, 12).toUpperCase()}`;
+const officeQrPayload = (settings: BusinessSettings, date = today()) =>
+  JSON.stringify({
+    type: settings.attendance_qr_mode === "daily" ? "daily" : "office_static",
+    token: settings.office_qr_token,
+    date: settings.attendance_qr_mode === "daily" ? date : "",
+  });
+
+type PayrollDraftRow = {
+  employee_internal_id: string;
+  employee_id: string;
+  employee_name: string;
+  position: string;
+  hari_masuk: number;
+  cuti_berbayar: number;
+  cuti_tidak_berbayar: number;
+  izin: number;
+  sakit: number;
+  alfa: number;
+  sisa_cuti: number;
+  komisi: number;
+  bonus: number;
+  lembur: number;
+  extra_chore: number;
+  potongan_manual: number;
+  potong_kasbon: boolean;
+  kasbon_deduction: number;
+  notes: string;
+  manual_override: boolean;
+};
 
 function nextEmployeeId(employees: Employee[]) {
   const latest = employees
@@ -281,6 +333,8 @@ function defaultBusiness(): BusinessSettings {
     payment_note: "Pembayaran dilakukan sesuai tanggal yang tercantum.",
     currency: "IDR",
     admin_pin: "0987",
+    attendance_qr_mode: "daily",
+    office_qr_token: makeOfficeQrToken(),
     updated_at: now(),
   };
 }
@@ -307,6 +361,7 @@ function makeComponent(name = "", type: ComponentType = "earning", order = 1): P
     company_paid: false,
     employee_deduction: type === "deduction",
     notes: "",
+    category: type === "deduction" ? "Deduction" : "Monthly Variable",
     sort_order: order,
     created_at: now(),
     updated_at: now(),
@@ -326,7 +381,22 @@ function seedStore(): Store {
         position: "Staff",
         active: true,
         default_salary: 5000000,
-        attendance_token: "EMP001",
+        base_salary_monthly: 5000000,
+        meal_allowance_per_day: 10000,
+        transport_allowance_per_day: 0,
+        work_days_per_month: 26,
+        leave_quota_monthly: 0,
+        leave_quota_yearly: 0,
+        bpjs_kesehatan_default: 0,
+        bpjs_ketenagakerjaan_default: 0,
+        fixed_allowance: 0,
+        hp_admin_allowance_enabled: false,
+        hp_admin_allowance_amount: 0,
+        bank_name: "",
+        account_number: "",
+        account_holder: "",
+        staff_pin: randomPin(),
+        attendance_token: makeAttendanceToken("EMP001"),
         notes: "",
         created_at: now(),
         updated_at: now(),
@@ -352,12 +422,38 @@ function loadStore(): Store {
     return {
       ...seeded,
       ...parsed,
-      business_settings: { ...seeded.business_settings, ...parsed.business_settings, admin_pin: parsed.business_settings?.admin_pin || "0987" },
+      business_settings: {
+        ...seeded.business_settings,
+        ...parsed.business_settings,
+        admin_pin: parsed.business_settings?.admin_pin || "0987",
+        attendance_qr_mode: parsed.business_settings?.attendance_qr_mode || "daily",
+        office_qr_token: parsed.business_settings?.office_qr_token || makeOfficeQrToken(),
+      },
       employees: (parsed.employees || seeded.employees).map((employee: Employee) => ({
         ...employee,
-        attendance_token: employee.attendance_token || employee.employee_id,
+        base_salary_monthly: employee.base_salary_monthly ?? employee.default_salary ?? 0,
+        meal_allowance_per_day: employee.meal_allowance_per_day ?? 10000,
+        transport_allowance_per_day: employee.transport_allowance_per_day ?? 0,
+        work_days_per_month: employee.work_days_per_month ?? 26,
+        leave_quota_monthly: employee.leave_quota_monthly ?? 0,
+        leave_quota_yearly: employee.leave_quota_yearly ?? 0,
+        bpjs_kesehatan_default: employee.bpjs_kesehatan_default ?? 0,
+        bpjs_ketenagakerjaan_default: employee.bpjs_ketenagakerjaan_default ?? 0,
+        fixed_allowance: employee.fixed_allowance ?? 0,
+        hp_admin_allowance_enabled: employee.hp_admin_allowance_enabled ?? false,
+        hp_admin_allowance_amount: employee.hp_admin_allowance_amount ?? 0,
+        bank_name: employee.bank_name ?? "",
+        account_number: employee.account_number ?? "",
+        account_holder: employee.account_holder ?? "",
+        staff_pin: employee.staff_pin || randomPin(),
+        attendance_token: employee.attendance_token || makeAttendanceToken(employee.employee_id),
       })),
-      attendance_logs: parsed.attendance_logs || [],
+      attendance_logs: (parsed.attendance_logs || []).map((log: AttendanceLog) => ({
+        ...log,
+        qr_type: log.qr_type || (log.source === "qr" ? "daily" : undefined),
+        qr_date: log.qr_date || log.date,
+        pin_verified: log.pin_verified ?? log.source === "qr",
+      })),
       extra_work_records: parsed.extra_work_records || [],
       employee_cash_advances: parsed.employee_cash_advances || [],
       kasbon_deductions: parsed.kasbon_deductions || [],
@@ -384,6 +480,106 @@ function ensureComponent(store: Store, name: string, type: ComponentType) {
   };
 }
 
+function attendanceDefaultsFor(employee: Employee, logs: AttendanceLog[], month: number, year: number) {
+  const from = monthStart(month, year);
+  const to = monthEnd(month, year);
+  const monthly = logs.filter((log) => log.employee_id === employee.employee_id && log.date >= from && log.date <= to);
+  const count = (status: AttendanceStatus) => monthly.filter((log) => log.status === status).length;
+  const hariMasuk = monthly.length ? monthly.filter((log) => ["hadir", "telat"].includes(log.status)).length : employee.work_days_per_month || 26;
+  const paidLeave = count("cuti_berbayar");
+  const unpaidLeave = count("cuti_tidak_berbayar");
+  return {
+    hari_masuk: hariMasuk,
+    cuti_berbayar: paidLeave,
+    cuti_tidak_berbayar: unpaidLeave,
+    izin: count("izin"),
+    sakit: count("sakit"),
+    alfa: count("alfa"),
+    sisa_cuti: Math.max(0, (employee.leave_quota_monthly || 0) - paidLeave),
+  };
+}
+
+function createPayrollDraftRows(store: Store, month: number, year: number) {
+  return store.employees.filter((employee) => employee.active).map((employee) => {
+    const att = attendanceDefaultsFor(employee, store.attendance_logs, month, year);
+    const from = monthStart(month, year);
+    const to = monthEnd(month, year);
+    const overtime = store.extra_work_records.filter((record) => record.employee_id === employee.employee_id && record.status === "approved" && record.type === "overtime" && record.date >= from && record.date <= to).reduce((sum, record) => sum + record.amount, 0);
+    const extra = store.extra_work_records.filter((record) => record.employee_id === employee.employee_id && record.status === "approved" && record.type === "extra_chore" && record.date >= from && record.date <= to).reduce((sum, record) => sum + record.amount, 0);
+    return {
+      employee_internal_id: employee.id,
+      employee_id: employee.employee_id,
+      employee_name: employee.name,
+      position: employee.position,
+      ...att,
+      komisi: 0,
+      bonus: 0,
+      lembur: overtime,
+      extra_chore: extra,
+      potongan_manual: 0,
+      potong_kasbon: false,
+      kasbon_deduction: 0,
+      notes: "",
+      manual_override: false,
+    };
+  });
+}
+
+function calculatePayrollRow(employee: Employee, row: PayrollDraftRow) {
+  const workDays = employee.work_days_per_month || 26;
+  const base = employee.base_salary_monthly || employee.default_salary || 0;
+  const dailySalary = workDays ? base / workDays : 0;
+  const unpaidDays = cleanNumber(row.cuti_tidak_berbayar) + cleanNumber(row.alfa);
+  const baseDeduction = dailySalary * unpaidDays;
+  const finalBase = Math.max(0, Math.min(base, base - baseDeduction));
+  const meal = cleanNumber(employee.meal_allowance_per_day) * cleanNumber(row.hari_masuk);
+  const transport = cleanNumber(employee.transport_allowance_per_day) * cleanNumber(row.hari_masuk);
+  const hpAdmin = employee.hp_admin_allowance_enabled ? cleanNumber(employee.hp_admin_allowance_amount) : 0;
+  const totalEarning = finalBase + meal + transport + cleanNumber(employee.fixed_allowance) + hpAdmin + cleanNumber(row.komisi) + cleanNumber(row.bonus) + cleanNumber(row.lembur) + cleanNumber(row.extra_chore);
+  const totalDeduction = cleanNumber(employee.bpjs_kesehatan_default) + cleanNumber(employee.bpjs_ketenagakerjaan_default) + cleanNumber(row.potongan_manual) + (row.potong_kasbon ? cleanNumber(row.kasbon_deduction) : 0);
+  return {
+    dailySalary,
+    unpaidDays,
+    baseDeduction,
+    finalBase,
+    meal,
+    transport,
+    hpAdmin,
+    totalEarning,
+    totalDeduction,
+    takeHome: totalEarning - totalDeduction,
+  };
+}
+
+function payrollComponentsFromDraft(employee: Employee, row: PayrollDraftRow): PayrollRowComponent[] {
+  const calc = calculatePayrollRow(employee, row);
+  return [
+    ["Gaji Pokok Final", "earning", calc.finalBase, `Gaji pokok bulanan setelah penyesuaian cuti/alfa`],
+    ["Uang Makan", "earning", calc.meal, `${row.hari_masuk} hari x ${employee.meal_allowance_per_day}`],
+    ["Transport", "earning", calc.transport, `${row.hari_masuk} hari x ${employee.transport_allowance_per_day}`],
+    ["Tunjangan Tetap", "earning", employee.fixed_allowance, ""],
+    ["Tunjangan HP/Admin", "earning", calc.hpAdmin, ""],
+    ["Komisi", "earning", row.komisi, ""],
+    ["Bonus", "earning", row.bonus, ""],
+    ["Lembur", "earning", row.lembur, ""],
+    ["Extra Chore", "earning", row.extra_chore, ""],
+    ["BPJS Kesehatan", "deduction", employee.bpjs_kesehatan_default, ""],
+    ["BPJS Ketenagakerjaan", "deduction", employee.bpjs_ketenagakerjaan_default, ""],
+    ["Kasbon", "deduction", row.potong_kasbon ? row.kasbon_deduction : 0, ""],
+    ["Potongan Manual", "deduction", row.potongan_manual, ""],
+  ].map(([name, type, amount, note], index) => ({
+    id: uid("row_component"),
+    payroll_row_id: "",
+    component_name: String(name),
+    component_type: type as ComponentType,
+    amount: cleanNumber(amount),
+    show_in_pdf: true,
+    hide_if_zero: true,
+    sort_order: index + 1,
+    source_component_id: String(note || ""),
+  }));
+}
+
 function generateSlipId(store: Store, employeeId: string, month: number, year: number) {
   const yyyymm = `${year}${String(month).padStart(2, "0")}`;
   const prefix = `PAY-${yyyymm}-${employeeId}-`;
@@ -407,7 +603,7 @@ function createPayslipPdf(payload: {
   employee: Partial<Employee> & { employee_id: string; name: string; status: string };
   components: PayrollRowComponent[];
   totals: { total_earning: number; total_deduction: number; take_home_pay: number };
-  payment: { slip_id: string; month: number; year: number; payment_date: string; finalized_at?: string };
+  payment: { slip_id: string; month: number; year: number; payment_date: string; finalized_at?: string; payroll_detail?: PayrollDraftRow; calculation?: ReturnType<typeof calculatePayrollRow> };
   save?: boolean;
   print?: boolean;
 }) {
@@ -469,6 +665,24 @@ function createPayslipPdf(payload: {
     columnStyles: { 0: { fontStyle: "bold", cellWidth: 42 }, 1: { cellWidth: 65 } },
     margin: { left: 18, right: 18 },
   });
+
+  if (payment.payroll_detail) {
+    const detail = payment.payroll_detail;
+    autoTable(doc, {
+      startY: (doc as unknown as { lastAutoTable: { finalY: number } }).lastAutoTable.finalY + 5,
+      theme: "grid",
+      head: [["Attendance Summary", "Hari"]],
+      body: [
+        ["Hari Masuk", String(detail.hari_masuk)],
+        ["Cuti Berbayar", String(detail.cuti_berbayar)],
+        ["Cuti Tidak Berbayar", String(detail.cuti_tidak_berbayar)],
+        ["Alfa", String(detail.alfa)],
+        ["Sisa Cuti", String(detail.sisa_cuti)],
+      ],
+      styles: { fontSize: 8, cellPadding: 1.8 },
+      margin: { left: 18, right: 18 },
+    });
+  }
 
   const earnings = getVisibleComponents(components).filter((item) => item.component_type === "earning");
   const deductions = getVisibleComponents(components).filter((item) => item.component_type === "deduction");
@@ -547,6 +761,12 @@ function App() {
   const [selectedEmployeeId, setSelectedEmployeeId] = useState(store.employees[0]?.id || "");
   const [attendanceEmployeeId, setAttendanceEmployeeId] = useState("");
   const [attendanceSource, setAttendanceSource] = useState<"qr" | "manual">("manual");
+  const [attendanceQrInput, setAttendanceQrInput] = useState("");
+  const [attendanceQrValid, setAttendanceQrValid] = useState(false);
+  const [attendanceQrType, setAttendanceQrType] = useState<"office_static" | "daily">("daily");
+  const [staffPinInput, setStaffPinInput] = useState("");
+  const [manualAdminPin, setManualAdminPin] = useState("");
+  const [officeQrDataUrl, setOfficeQrDataUrl] = useState("");
   const [attendanceMessage, setAttendanceMessage] = useState("");
   const [showExtraPrompt, setShowExtraPrompt] = useState<Employee | null>(null);
   const [extraDraft, setExtraDraft] = useState({ type: "overtime" as ExtraWorkType, hours: 0, quantity: 0, amount: 0, notes: "" });
@@ -573,6 +793,10 @@ function App() {
   const [pinInput, setPinInput] = useState("");
   const [pinError, setPinError] = useState("");
   const [qrMap, setQrMap] = useState<Record<string, string>>({});
+  const [shownPins, setShownPins] = useState<Record<string, boolean>>({});
+  const [advancedQrEmployee, setAdvancedQrEmployee] = useState<Employee | null>(null);
+  const [payrollRowsDraft, setPayrollRowsDraft] = useState<PayrollDraftRow[]>([]);
+  const [detailRowId, setDetailRowId] = useState("");
 
   const saveStore = (next: Store) => {
     setStore(next);
@@ -598,13 +822,62 @@ function App() {
       setPage(pendingPage || "Dashboard");
       return;
     }
-    setPinError("PIN salah. Coba lagi.");
+    setPinError("PIN salah. Silakan coba lagi.");
   };
 
   const lockAdmin = () => {
     sessionStorage.removeItem("payroll_admin_unlocked");
     setAdminUnlocked(false);
     setPage("Absensi Staff");
+  };
+
+  const validateOfficeQr = (raw = attendanceQrInput) => {
+    try {
+      const payload = JSON.parse(raw) as { type?: string; token?: string; date?: string };
+      if (payload.token !== store.business_settings.office_qr_token) {
+        setAttendanceQrValid(false);
+        setAttendanceMessage("QR absensi tidak valid.");
+        return false;
+      }
+      if (payload.type === "daily" && payload.date !== today()) {
+        setAttendanceQrValid(false);
+        setAttendanceMessage("QR absensi sudah tidak berlaku. Silakan scan QR hari ini.");
+        return false;
+      }
+      setAttendanceQrValid(true);
+      setAttendanceQrType(payload.type === "office_static" ? "office_static" : "daily");
+      setAttendanceSource("qr");
+      setAttendanceMessage(payload.type === "daily" ? "QR hari ini valid." : "QR Absensi Kantor valid.");
+      return true;
+    } catch {
+      setAttendanceQrValid(false);
+      setAttendanceMessage("QR absensi tidak valid.");
+      return false;
+    }
+  };
+
+  const generateOfficeQr = async (regenerate = false) => {
+    const nextSettings = regenerate
+      ? { ...store.business_settings, office_qr_token: makeOfficeQrToken(), updated_at: now() }
+      : store.business_settings;
+    if (regenerate) saveStore({ ...store, business_settings: nextSettings });
+    const dataUrl = await QRCode.toDataURL(officeQrPayload(nextSettings), { margin: 1, width: 320 });
+    setOfficeQrDataUrl(dataUrl);
+  };
+
+  const downloadOfficeQr = async (print = false) => {
+    const dataUrl = officeQrDataUrl || await QRCode.toDataURL(officeQrPayload(store.business_settings), { margin: 1, width: 360 });
+    if (print) {
+      const popup = window.open("", "_blank");
+      popup?.document.write(`<html><body style="font-family:Arial;text-align:center;padding:32px"><h2>QR Absensi Kantor</h2><p>${store.business_settings.attendance_qr_mode === "daily" ? `QR Harian ${today()}` : "Static Office QR"}</p><img src="${dataUrl}" /></body></html>`);
+      popup?.document.close();
+      popup?.print();
+      return;
+    }
+    const link = document.createElement("a");
+    link.href = dataUrl;
+    link.download = `qr-absensi-kantor-${store.business_settings.attendance_qr_mode === "daily" ? today() : "static"}.png`;
+    link.click();
   };
 
   const ensureEmployeeToken = (employee: Employee) => {
@@ -651,6 +924,10 @@ function App() {
 
   const clockIn = () => {
     if (!attendanceEmployee) return alert("Pilih atau masukkan Employee ID yang valid.");
+    if (!attendanceEmployee.active) return alert("Karyawan tidak aktif.");
+    if (attendanceSource === "qr" && !attendanceQrValid) return alert("Scan QR Absensi Kantor yang valid terlebih dahulu.");
+    if (attendanceSource === "manual" && manualAdminPin !== (store.business_settings.admin_pin || "0987")) return alert("Manual fallback memerlukan PIN admin.");
+    if (attendanceEmployee.staff_pin !== staffPinInput) return alert("PIN Staff salah. Silakan coba lagi.");
     if (todayAttendance?.clock_in_time) return alert("Karyawan ini sudah clock in hari ini.");
     const log: AttendanceLog = {
       id: uid("attendance"),
@@ -667,6 +944,9 @@ function App() {
       status: currentTime() > "09:00" ? "telat" : "hadir",
       notes: "",
       source: attendanceSource,
+      qr_type: attendanceSource === "qr" ? attendanceQrType : undefined,
+      qr_date: attendanceSource === "qr" ? today() : "",
+      pin_verified: attendanceEmployee.staff_pin === staffPinInput,
       created_at: now(),
       updated_at: now(),
     };
@@ -676,6 +956,9 @@ function App() {
 
   const clockOut = () => {
     if (!attendanceEmployee || !todayAttendance) return alert("Clock in terlebih dahulu.");
+    if (attendanceSource === "qr" && !attendanceQrValid) return alert("Scan QR Absensi Kantor yang valid terlebih dahulu.");
+    if (attendanceSource === "manual" && manualAdminPin !== (store.business_settings.admin_pin || "0987")) return alert("Manual fallback memerlukan PIN admin.");
+    if (attendanceEmployee.staff_pin !== staffPinInput) return alert("PIN Staff salah. Silakan coba lagi.");
     if (todayAttendance.clock_out_time) return alert("Karyawan ini sudah clock out hari ini.");
     const out = currentTime();
     const total = timeDiffMinutes(todayAttendance.date, todayAttendance.clock_in_time, out);
@@ -683,7 +966,7 @@ function App() {
     saveStore({
       ...store,
       attendance_logs: store.attendance_logs.map((log) =>
-        log.id === todayAttendance.id ? { ...log, clock_out_time: out, total_work_minutes: total, overtime_minutes: overtime, updated_at: now() } : log,
+        log.id === todayAttendance.id ? { ...log, clock_out_time: out, total_work_minutes: total, overtime_minutes: overtime, pin_verified: true, updated_at: now() } : log,
       ),
     });
     setAttendanceMessage(`Clock out berhasil: ${attendanceEmployee.name} pukul ${out}.`);
@@ -840,7 +1123,14 @@ function App() {
     const tokenExists = (token: string) => store.employees.some((employee) => employee.id !== draftEmployee.id && employee.attendance_token === token);
     let token = draftEmployee.attendance_token || makeAttendanceToken(employeeId);
     while (tokenExists(token)) token = makeAttendanceToken(employeeId);
-    const nextEmployee = { ...draftEmployee, employee_id: employeeId, attendance_token: token, updated_at: now() };
+    const nextEmployee = {
+      ...draftEmployee,
+      employee_id: employeeId,
+      default_salary: draftEmployee.base_salary_monthly,
+      staff_pin: draftEmployee.staff_pin || randomPin(),
+      attendance_token: token,
+      updated_at: now(),
+    };
     saveStore({
       ...store,
       employees: exists
@@ -989,6 +1279,65 @@ function App() {
     setPage("Payslip History");
   };
 
+  const finalizeMonthlyRow = (draft: PayrollDraftRow) => {
+    const employee = store.employees.find((item) => item.id === draft.employee_internal_id);
+    if (!employee) return;
+    if (!confirm("Setelah slip disimpan final, isi slip akan dikunci sebagai arsip.")) return;
+    const run = store.payroll_runs.find((item) => item.month === runMonth && item.year === runYear) || {
+      id: uid("run"),
+      month: runMonth,
+      year: runYear,
+      status: "Draft" as RowStatus,
+      created_at: now(),
+      updated_at: now(),
+    };
+    const rowId = uid("row");
+    const slipId = generateSlipId(store, employee.employee_id, runMonth, runYear);
+    const calc = calculatePayrollRow(employee, draft);
+    const rowComponents = payrollComponentsFromDraft(employee, draft).map((component) => ({ ...component, payroll_row_id: rowId }));
+    const row: PayrollRow = {
+      id: rowId,
+      payroll_run_id: run.id,
+      employee_id: employee.employee_id,
+      employee_name: employee.name,
+      employee_status: employee.status,
+      slip_id: slipId,
+      payment_date: paymentDate,
+      total_earning: calc.totalEarning,
+      total_deduction: calc.totalDeduction,
+      take_home_pay: calc.takeHome,
+      status: "Finalized",
+      created_at: now(),
+      updated_at: now(),
+    };
+    const saved: SavedPayslip = {
+      id: uid("saved_slip"),
+      slip_id: slipId,
+      payroll_row_id: rowId,
+      month: runMonth,
+      year: runYear,
+      employee_id: employee.employee_id,
+      employee_name: employee.name,
+      status: "Finalized",
+      business_snapshot_json: JSON.stringify(store.business_settings),
+      employee_snapshot_json: JSON.stringify(employee),
+      component_snapshot_json: JSON.stringify(rowComponents),
+      totals_snapshot_json: JSON.stringify({ total_earning: calc.totalEarning, total_deduction: calc.totalDeduction, take_home_pay: calc.takeHome }),
+      payment_snapshot_json: JSON.stringify({ slip_id: slipId, month: runMonth, year: runYear, payment_date: paymentDate, payroll_detail: draft, calculation: calc }),
+      finalized_at: now(),
+      paid_at: "",
+      created_at: now(),
+    };
+    saveStore({
+      ...store,
+      payroll_runs: store.payroll_runs.some((item) => item.id === run.id) ? store.payroll_runs : [...store.payroll_runs, run],
+      payroll_rows: [...store.payroll_rows, row],
+      payroll_row_components: [...store.payroll_row_components, ...rowComponents],
+      saved_payslips: [saved, ...store.saved_payslips],
+    });
+    setSelectedSlipId(slipId);
+  };
+
   const previewDraft = (save = false, print = false) => {
     if (!selectedEmployee) return;
     createPayslipPdf({
@@ -1093,8 +1442,8 @@ function App() {
           <div className="modal-backdrop">
             <div className="modal-card">
               <h2>Masuk Admin</h2>
-              <p className="muted">Menu ini memerlukan PIN admin. Default PIN: 0987.</p>
-              <input autoFocus type="password" inputMode="numeric" placeholder="Masukkan PIN" value={pinInput} onChange={(e) => setPinInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && unlockAdmin()} />
+              <p className="muted">Menu ini hanya untuk admin. Masukkan PIN admin untuk melanjutkan.</p>
+              <input autoFocus type="password" inputMode="numeric" placeholder="Masukkan PIN Admin" value={pinInput} onChange={(e) => setPinInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && unlockAdmin()} />
               {pinError && <p className="error-text">{pinError}</p>}
               <div className="actions">
                 <button className="primary" onClick={unlockAdmin}><Check size={16} /> Buka Admin</button>
@@ -1128,6 +1477,75 @@ function App() {
           </div>
         )}
 
+        {advancedQrEmployee && (
+          <div className="modal-backdrop">
+            <div className="modal-card">
+              <h2>Advanced QR</h2>
+              <p className="muted">Fitur ini hanya cadangan admin. Rekomendasi utama tetap QR Harian Kantor + PIN Staff untuk mengurangi risiko titip absen.</p>
+              <div className="actions">
+                <button className="ghost" onClick={() => generateQr(advancedQrEmployee, Boolean(advancedQrEmployee.attendance_token))}><QrCode size={16} /> Generate / Regenerate QR</button>
+                <button className="ghost" onClick={() => downloadQr(advancedQrEmployee)}><Download size={16} /> Download QR</button>
+                <button className="ghost" onClick={() => downloadQr(advancedQrEmployee, true)}><Printer size={16} /> Print QR</button>
+              </div>
+              {qrMap[advancedQrEmployee.id] && <img className="qr-preview large" src={qrMap[advancedQrEmployee.id]} alt="" />}
+              <button className="primary" onClick={() => setAdvancedQrEmployee(null)}>Tutup</button>
+            </div>
+          </div>
+        )}
+
+        {detailRowId && (() => {
+          const row = payrollRowsDraft.find((item) => item.employee_internal_id === detailRowId);
+          const employee = store.employees.find((item) => item.id === detailRowId);
+          if (!row || !employee) return null;
+          const calc = calculatePayrollRow(employee, row);
+          return (
+            <div className="modal-backdrop">
+              <div className="modal-card wide-modal">
+                <h2>Detail Payroll - {employee.name}</h2>
+                <div className="detail-grid">
+                  <Breakdown title="Default Staff" rows={[
+                    ["Gaji Pokok Bulanan", formatIDR(employee.base_salary_monthly || employee.default_salary, store.business_settings.currency)],
+                    ["Uang Makan per Hari", formatIDR(employee.meal_allowance_per_day, store.business_settings.currency)],
+                    ["Transport per Hari", formatIDR(employee.transport_allowance_per_day, store.business_settings.currency)],
+                    ["Hari Kerja per Bulan", String(employee.work_days_per_month)],
+                    ["BPJS", `${formatIDR(employee.bpjs_kesehatan_default, store.business_settings.currency)} / ${formatIDR(employee.bpjs_ketenagakerjaan_default, store.business_settings.currency)}`],
+                    ["Tunjangan Tetap", formatIDR(employee.fixed_allowance, store.business_settings.currency)],
+                  ]} />
+                  <Breakdown title="Kehadiran Bulan Ini" rows={[
+                    ["Hari Masuk", `${row.hari_masuk} hari`],
+                    ["Cuti Berbayar", `${row.cuti_berbayar} hari`],
+                    ["Cuti Tidak Berbayar", `${row.cuti_tidak_berbayar} hari`],
+                    ["Izin", `${row.izin} hari`],
+                    ["Sakit", `${row.sakit} hari`],
+                    ["Alfa", `${row.alfa} hari`],
+                    ["Sisa Cuti", `${row.sisa_cuti} hari`],
+                  ]} />
+                  <Breakdown title="Pendapatan" rows={[
+                    ["Gaji Pokok Final", `${formatIDR(employee.base_salary_monthly || employee.default_salary, store.business_settings.currency)} - (${calc.unpaidDays} hari tidak dibayar x ${formatIDR(calc.dailySalary, store.business_settings.currency)}) = ${formatIDR(calc.finalBase, store.business_settings.currency)}`],
+                    ["Uang Makan", `${row.hari_masuk} hari x ${formatIDR(employee.meal_allowance_per_day, store.business_settings.currency)} = ${formatIDR(calc.meal, store.business_settings.currency)}`],
+                    ["Transport", `${row.hari_masuk} hari x ${formatIDR(employee.transport_allowance_per_day, store.business_settings.currency)} = ${formatIDR(calc.transport, store.business_settings.currency)}`],
+                    ["Komisi", formatIDR(row.komisi, store.business_settings.currency)],
+                    ["Bonus", formatIDR(row.bonus, store.business_settings.currency)],
+                    ["Lembur", formatIDR(row.lembur, store.business_settings.currency)],
+                    ["Extra Chore", formatIDR(row.extra_chore, store.business_settings.currency)],
+                  ]} />
+                  <Breakdown title="Potongan & Summary" rows={[
+                    ["BPJS Kesehatan", formatIDR(employee.bpjs_kesehatan_default, store.business_settings.currency)],
+                    ["BPJS Ketenagakerjaan", formatIDR(employee.bpjs_ketenagakerjaan_default, store.business_settings.currency)],
+                    ["Kasbon", formatIDR(row.potong_kasbon ? row.kasbon_deduction : 0, store.business_settings.currency)],
+                    ["Potongan Manual", formatIDR(row.potongan_manual, store.business_settings.currency)],
+                    ["Total Pendapatan", formatIDR(calc.totalEarning, store.business_settings.currency)],
+                    ["Total Potongan", formatIDR(calc.totalDeduction, store.business_settings.currency)],
+                    ["Take Home Pay", formatIDR(calc.takeHome, store.business_settings.currency)],
+                  ]} />
+                </div>
+                <div className="actions"><span className="badge draft">Draft</span>{row.manual_override && <span className="badge pending">Manual Override</span>}{row.potong_kasbon && <span className="badge approved">Kasbon Deducted</span>}<span className="badge active">Ready to Finalize</span></div>
+                <button className="primary" onClick={() => setDetailRowId("")}>Tutup</button>
+              </div>
+            </div>
+          );
+        })()}
+
         {page !== "Absensi Staff" && !adminUnlocked && <AdminLocked onOpen={() => requestPage(page)} />}
 
         {page === "Absensi Staff" && (
@@ -1136,17 +1554,31 @@ function App() {
               <h2>Absensi Staff</h2>
               <strong>{new Date().toLocaleString("id-ID", { dateStyle: "full", timeStyle: "short" })}</strong>
               <div className="attendance-methods">
-                <button className={attendanceSource === "qr" ? "primary" : "ghost"} onClick={() => setAttendanceSource("qr")}><QrCode size={18} /> Scan QR Staff ID</button>
-                <button className={attendanceSource === "manual" ? "primary" : "ghost"} onClick={() => setAttendanceSource("manual")}><Users size={18} /> Manual Employee ID</button>
+                <button className={attendanceSource === "qr" ? "primary" : "ghost"} onClick={() => setAttendanceSource("qr")}><QrCode size={18} /> Scan QR Absensi Kantor</button>
+                <button className={attendanceSource === "manual" ? "primary" : "ghost"} onClick={() => setAttendanceSource("manual")}><Users size={18} /> Input Manual</button>
               </div>
-              <div className="form-grid">
-                <Input label={attendanceSource === "qr" ? "Hasil scan QR / Token" : "Employee ID"} value={attendanceEmployeeId} onChange={setAttendanceEmployeeId} />
-                <label>Pilih karyawan<select value={attendanceEmployee?.id || ""} onChange={(e) => {
+              {attendanceSource === "qr" && (
+                <div className="form-grid">
+                  <label className="full">QR Absensi Kantor<textarea placeholder="Tempel hasil scan QR Absensi Kantor / QR Harian" value={attendanceQrInput} onChange={(e) => setAttendanceQrInput(e.target.value)} /></label>
+                  <button className="primary" onClick={() => validateOfficeQr()}><QrCode size={16} /> Validasi QR</button>
+                  <span className={`badge ${attendanceQrValid ? "active" : "inactive"}`}>{attendanceQrValid ? "QR hari ini valid" : "QR belum valid"}</span>
+                </div>
+              )}
+              {attendanceSource === "manual" && (
+                <div className="warning-card">
+                  <strong>Input Manual</strong>
+                  <p className="muted">Fallback manual hanya untuk admin/emergency dan memerlukan PIN admin.</p>
+                  <input type="password" inputMode="numeric" placeholder="PIN Admin" value={manualAdminPin} onChange={(e) => setManualAdminPin(e.target.value)} />
+                </div>
+              )}
+              {(attendanceQrValid || attendanceSource === "manual") && <div className="form-grid">
+                <Input label="ID Karyawan" value={attendanceEmployeeId} onChange={setAttendanceEmployeeId} />
+                <label>Pilih Staff<select value={attendanceEmployee?.id || ""} onChange={(e) => {
                   const employee = store.employees.find((item) => item.id === e.target.value);
                   setAttendanceEmployeeId(employee?.employee_id || "");
-                  setAttendanceSource("manual");
                 }}><option value="">Pilih fallback manual</option>{store.employees.filter((e) => e.active).map((employee) => <option key={employee.id} value={employee.id}>{employee.employee_id} - {employee.name}</option>)}</select></label>
-              </div>
+                <label>PIN Staff<input type="password" inputMode="numeric" placeholder="Masukkan PIN Staff" value={staffPinInput} onChange={(e) => setStaffPinInput(e.target.value)} /></label>
+              </div>}
               {attendanceEmployee && <div className="confirm-card"><strong>{attendanceEmployee.name}</strong><span>{attendanceEmployee.employee_id} | {attendanceEmployee.status}</span></div>}
               <div className="big-actions">
                 <button className="primary" onClick={clockIn}><Clock size={22} /> Clock In</button>
@@ -1193,15 +1625,26 @@ function App() {
                 {!statusOptions.includes(draftEmployee.status) && <Input label="Status custom" value={draftEmployee.status} onChange={(v) => setDraftEmployee({ ...draftEmployee, status: v })} />}
                 <label>Posisi<select value={positionOptions.includes(draftEmployee.position) ? draftEmployee.position : "Custom"} onChange={(e) => setDraftEmployee({ ...draftEmployee, position: e.target.value === "Custom" ? "" : e.target.value })}>{positionOptions.map((option) => <option key={option} value={option}>{option}</option>)}</select></label>
                 {!positionOptions.includes(draftEmployee.position) && <Input label="Posisi custom" value={draftEmployee.position} onChange={(v) => setDraftEmployee({ ...draftEmployee, position: v })} />}
-                <Input label="Gaji Default" type="number" value={draftEmployee.default_salary} onChange={(v) => setDraftEmployee({ ...draftEmployee, default_salary: cleanNumber(v) })} />
+                <Input label="Gaji Pokok Bulanan" type="number" value={draftEmployee.base_salary_monthly} onChange={(v) => setDraftEmployee({ ...draftEmployee, base_salary_monthly: cleanNumber(v), default_salary: cleanNumber(v) })} />
+                <Input label="Hari Kerja per Bulan" type="number" value={draftEmployee.work_days_per_month} onChange={(v) => setDraftEmployee({ ...draftEmployee, work_days_per_month: cleanNumber(v) })} />
+                <Input label="Uang Makan per Hari" type="number" value={draftEmployee.meal_allowance_per_day} onChange={(v) => setDraftEmployee({ ...draftEmployee, meal_allowance_per_day: cleanNumber(v) })} />
+                <Input label="Transport per Hari" type="number" value={draftEmployee.transport_allowance_per_day} onChange={(v) => setDraftEmployee({ ...draftEmployee, transport_allowance_per_day: cleanNumber(v) })} />
+                <Input label="Jatah Cuti per Bulan" type="number" value={draftEmployee.leave_quota_monthly} onChange={(v) => setDraftEmployee({ ...draftEmployee, leave_quota_monthly: cleanNumber(v) })} />
+                <Input label="Jatah Cuti per Tahun" type="number" value={draftEmployee.leave_quota_yearly} onChange={(v) => setDraftEmployee({ ...draftEmployee, leave_quota_yearly: cleanNumber(v) })} />
+                <Input label="BPJS Kesehatan" type="number" value={draftEmployee.bpjs_kesehatan_default} onChange={(v) => setDraftEmployee({ ...draftEmployee, bpjs_kesehatan_default: cleanNumber(v) })} />
+                <Input label="BPJS Ketenagakerjaan" type="number" value={draftEmployee.bpjs_ketenagakerjaan_default} onChange={(v) => setDraftEmployee({ ...draftEmployee, bpjs_ketenagakerjaan_default: cleanNumber(v) })} />
+                <Input label="Tunjangan Tetap" type="number" value={draftEmployee.fixed_allowance} onChange={(v) => setDraftEmployee({ ...draftEmployee, fixed_allowance: cleanNumber(v) })} />
+                <Toggle label="Tunjangan HP/Admin" checked={draftEmployee.hp_admin_allowance_enabled} onChange={(v) => setDraftEmployee({ ...draftEmployee, hp_admin_allowance_enabled: v })} />
+                {draftEmployee.hp_admin_allowance_enabled && <Input label="Nominal Tunjangan HP/Admin" type="number" value={draftEmployee.hp_admin_allowance_amount} onChange={(v) => setDraftEmployee({ ...draftEmployee, hp_admin_allowance_amount: cleanNumber(v) })} />}
+                <Input label="Bank Name" value={draftEmployee.bank_name} onChange={(v) => setDraftEmployee({ ...draftEmployee, bank_name: v })} />
+                <Input label="Account Number" value={draftEmployee.account_number} onChange={(v) => setDraftEmployee({ ...draftEmployee, account_number: v })} />
+                <Input label="Account Holder" value={draftEmployee.account_holder} onChange={(v) => setDraftEmployee({ ...draftEmployee, account_holder: v })} />
+                <label>PIN Staff<input type="password" inputMode="numeric" value={draftEmployee.staff_pin} onChange={(e) => setDraftEmployee({ ...draftEmployee, staff_pin: e.target.value })} /><span className="helper-text">Absensi utama menggunakan QR Kantor / QR Harian + PIN Staff.</span></label>
+                <button className="ghost" onClick={() => setDraftEmployee({ ...draftEmployee, staff_pin: randomPin() })}>Generate PIN</button>
                 <Toggle label="Aktif" checked={draftEmployee.active} onChange={(v) => setDraftEmployee({ ...draftEmployee, active: v })} />
                 <label className="full">Catatan<textarea value={draftEmployee.notes} onChange={(e) => setDraftEmployee({ ...draftEmployee, notes: e.target.value })} /></label>
               </div>
               <button className="primary" onClick={saveEmployee}><Save size={16} /> Simpan Karyawan</button>
-              <div className="qr-info-card">
-                <h3>QR Absensi</h3>
-                <p>Token QR dibuat otomatis untuk absensi. QR ini digunakan staff untuk absensi. Staff tidak perlu mengisi token manual.</p>
-              </div>
             </div>
             <div className="panel">
               <h2>Daftar Karyawan</h2>
@@ -1211,23 +1654,27 @@ function App() {
                     <div className="employee-card-main">
                       <div>
                         <strong>{employee.employee_id} | {employee.name}</strong>
-                        <span>{employee.status} | {employee.position || "-"} | {formatIDR(employee.default_salary, store.business_settings.currency)}</span>
+                        <span>{employee.status} • {employee.position || "-"}</span>
                         <span className={`badge ${employee.active ? "active" : "inactive"}`}>{employee.active ? "Aktif" : "Nonaktif"}</span>
                       </div>
-                      <div className="qr-section">
-                        <strong>QR Absensi</strong>
-                        <span>ID: {employee.employee_id}</span>
-                        <span className="helper-text">QR ini digunakan staff untuk absensi. Staff tidak perlu mengisi token manual.</span>
-                        {qrMap[employee.id] && <img className="qr-preview" src={qrMap[employee.id]} alt="" />}
+                      <div className="salary-mini-grid">
+                        <span>Gaji Pokok: <strong>{formatIDR(employee.base_salary_monthly || employee.default_salary, store.business_settings.currency)}</strong></span>
+                        <span>Uang Makan/Hari: <strong>{formatIDR(employee.meal_allowance_per_day, store.business_settings.currency)}</strong></span>
+                        <span>Transport/Hari: <strong>{formatIDR(employee.transport_allowance_per_day, store.business_settings.currency)}</strong></span>
+                        <span>Hari Kerja/Bulan: <strong>{employee.work_days_per_month}</strong></span>
+                        <span>Jatah Cuti: <strong>{employee.leave_quota_monthly || 0} hari/bulan • {employee.leave_quota_yearly || 0} hari/tahun</strong></span>
+                        <span>BPJS: <strong>{employee.bpjs_kesehatan_default || employee.bpjs_ketenagakerjaan_default ? "Aktif" : "Tidak aktif"}</strong></span>
+                      </div>
+                      <div className="pin-line">
+                        <span>PIN Staff: <strong>{shownPins[employee.id] ? employee.staff_pin : "****"}</strong></span>
                       </div>
                     </div>
                     <div className="row-actions">
                       <button className="ghost" title="Edit" onClick={() => setDraftEmployee(employee)}><Pencil size={16} /> Edit</button>
-                      <button className="ghost" title="Generate / Regenerate QR" onClick={() => generateQr(employee, Boolean(employee.attendance_token))}><QrCode size={16} /> QR Absensi</button>
-                      <button className="icon" title="Preview QR" onClick={() => generateQr(employee)}><Eye size={16} /></button>
-                      <button className="icon" title="Download QR" onClick={() => downloadQr(employee)}><Download size={16} /></button>
-                      <button className="icon" title="Print QR" onClick={() => downloadQr(employee, true)}><Printer size={16} /></button>
-                      <button className="danger" title="Deactivate" onClick={() => saveStore({ ...store, employees: store.employees.map((item) => item.id === employee.id ? { ...item, active: false, updated_at: now() } : item) })}>Deactivate</button>
+                      <button className="ghost" onClick={() => setShownPins({ ...shownPins, [employee.id]: !shownPins[employee.id] })}>Show PIN</button>
+                      <button className="ghost" onClick={() => saveStore({ ...store, employees: store.employees.map((item) => item.id === employee.id ? { ...item, staff_pin: randomPin(), updated_at: now() } : item) })}>Reset PIN</button>
+                      <button className="ghost" onClick={() => setAdvancedQrEmployee(employee)}><QrCode size={16} /> Advanced QR</button>
+                      <button className={employee.active ? "danger" : "ghost"} title="Deactivate" onClick={() => saveStore({ ...store, employees: store.employees.map((item) => item.id === employee.id ? { ...item, active: !item.active, updated_at: now() } : item) })}>{employee.active ? "Nonaktifkan" : "Aktifkan"}</button>
                     </div>
                   </div>
                 ))}
@@ -1241,47 +1688,49 @@ function App() {
             <div className="section-head">
               <h2>Generate Payroll</h2>
               <div className="actions">
-                <button className="ghost" onClick={() => previewDraft(false)}><Eye size={16} /> Pratinjau Slip</button>
-                <button className="ghost" onClick={() => previewDraft(true)}><Download size={16} /> Download PDF</button>
-                <button className="ghost" onClick={() => previewDraft(false, true)}><Printer size={16} /> Cetak</button>
-                <button className="primary" onClick={finalizeSlip}><Check size={16} /> Simpan Slip Final</button>
+                <button className="primary" onClick={() => setPayrollRowsDraft(createPayrollDraftRows(store, runMonth, runYear))}><Check size={16} /> Generate / Load Payroll</button>
+                <button className="ghost" onClick={() => setPayrollRowsDraft(createPayrollDraftRows(store, runMonth, runYear))}>Tarik dari Absensi</button>
+                <button className="ghost" onClick={() => setPayrollRowsDraft(createPayrollDraftRows(store, runMonth, runYear))}><RotateCcw size={16} /> Reset ke Default Staff</button>
               </div>
             </div>
             <div className="form-grid four">
-              <label>Karyawan<select value={selectedEmployeeId} onChange={(e) => setSelectedEmployeeId(e.target.value)}>{store.employees.filter((e) => e.active).map((e) => <option key={e.id} value={e.id}>{e.employee_id} - {e.name}</option>)}</select></label>
               <label>Bulan<select value={runMonth} onChange={(e) => setRunMonth(Number(e.target.value))}>{months.map((m, i) => <option key={m} value={i + 1}>{m}</option>)}</select></label>
               <Input label="Tahun" type="number" value={runYear} onChange={(v) => setRunYear(cleanNumber(v))} />
               <Input label="Tanggal Pembayaran" type="date" value={paymentDate} onChange={setPaymentDate} />
             </div>
-            <div className="payroll-reminders">
-              <div><strong>Absensi bulan ini</strong><span>Hadir {monthlyAttendance.filter((log) => log.status === "hadir").length}, Telat {monthlyAttendance.filter((log) => log.status === "telat").length}, Alfa {monthlyAttendance.filter((log) => log.status === "alfa").length}</span></div>
-              <div><strong>Lembur approved</strong><span>{approvedOvertime.length} record | {formatIDR(approvedOvertime.reduce((sum, record) => sum + record.amount, 0), store.business_settings.currency)}</span></div>
-              <div><strong>Extra chore approved</strong><span>{approvedExtraChore.length} record | {formatIDR(approvedExtraChore.reduce((sum, record) => sum + record.amount, 0), store.business_settings.currency)}</span></div>
-              <div className={activeKasbon.length ? "warning-card" : ""}><strong>Kasbon aktif</strong><span>{formatIDR(activeKasbon.reduce((sum, item) => sum + item.remaining_balance, 0), store.business_settings.currency)}</span></div>
+            <div className="info-strip">
+              <span>Cuti berbayar tidak memotong gaji pokok.</span>
+              <span>Cuti tidak berbayar dan alfa memotong gaji pokok.</span>
+              <span>Uang makan dan transport dihitung berdasarkan hari masuk.</span>
             </div>
-            {activeKasbon.length > 0 && <p className="warning-text">Karyawan ini memiliki kasbon aktif. Potongan kasbon tidak otomatis, admin harus memilih nominal potongan.</p>}
-            <div className="actions">
-              <button className="ghost" onClick={pullAttendance}>Tarik Data Absensi</button>
-              <button className="ghost" onClick={pullOvertime}>Tarik Lembur Approved</button>
-              <button className="ghost" onClick={pullExtraChore}>Tarik Extra Chore Approved</button>
-              <button className="ghost" onClick={applyKasbonDeduction}>Cek Kasbon Aktif</button>
-              <label className="toggle"><input type="checkbox" checked={deductKasbon} onChange={(e) => setDeductKasbon(e.target.checked)} /><span>Potong kasbon bulan ini</span></label>
-              {deductKasbon && <input className="small-input" type="number" value={kasbonDeductionAmount} onChange={(e) => {
-                const value = cleanNumber(e.target.value);
-                setKasbonDeductionAmount(value);
-                applyAmountToComponent("Kasbon", value, "deduction");
-              }} />}
+            <div className="payroll-table-wrap">
+              <table className="payroll-table">
+                <thead><tr><th className="sticky-col">Staff</th><th>Posisi</th><th>Gaji Pokok</th><th>Hari Masuk</th><th>Cuti Berbayar</th><th>Cuti Tidak Berbayar</th><th>Alfa</th><th>Komisi</th><th>Bonus</th><th>Lembur</th><th>Potongan</th><th>Kasbon</th><th>Take Home Pay</th><th>Detail</th></tr></thead>
+                <tbody>{payrollRowsDraft.map((row) => {
+                  const employee = store.employees.find((item) => item.id === row.employee_internal_id)!;
+                  const calc = calculatePayrollRow(employee, row);
+                  const activeBalance = store.employee_cash_advances.filter((item) => item.employee_id === row.employee_id && ["active", "partially_paid"].includes(item.status)).reduce((sum, item) => sum + item.remaining_balance, 0);
+                  const updateRow = (patch: Partial<PayrollDraftRow>) => setPayrollRowsDraft(payrollRowsDraft.map((item) => item.employee_internal_id === row.employee_internal_id ? { ...item, ...patch, manual_override: true } : item));
+                  return <tr key={row.employee_internal_id}>
+                    <td className="sticky-col"><strong>{row.employee_id}</strong><span className="muted">{row.employee_name}</span>{activeBalance > 0 && <span className="warning-text">Karyawan ini memiliki kasbon aktif.</span>}</td>
+                    <td>{row.position}</td>
+                    <td className="money">{formatIDR(employee.base_salary_monthly || employee.default_salary, store.business_settings.currency)}</td>
+                    <td><input type="number" value={row.hari_masuk} onChange={(e) => updateRow({ hari_masuk: cleanNumber(e.target.value) })} /></td>
+                    <td><input type="number" value={row.cuti_berbayar} onChange={(e) => updateRow({ cuti_berbayar: cleanNumber(e.target.value) })} /></td>
+                    <td><input type="number" value={row.cuti_tidak_berbayar} onChange={(e) => updateRow({ cuti_tidak_berbayar: cleanNumber(e.target.value) })} /></td>
+                    <td><input type="number" value={row.alfa} onChange={(e) => updateRow({ alfa: cleanNumber(e.target.value) })} /></td>
+                    <td><input type="number" value={row.komisi} onChange={(e) => updateRow({ komisi: cleanNumber(e.target.value) })} /></td>
+                    <td><input type="number" value={row.bonus} onChange={(e) => updateRow({ bonus: cleanNumber(e.target.value) })} /></td>
+                    <td><input type="number" value={row.lembur} onChange={(e) => updateRow({ lembur: cleanNumber(e.target.value) })} /></td>
+                    <td><input type="number" value={row.potongan_manual} onChange={(e) => updateRow({ potongan_manual: cleanNumber(e.target.value) })} /></td>
+                    <td><label className="toggle compact-toggle"><input type="checkbox" checked={row.potong_kasbon} onChange={(e) => updateRow({ potong_kasbon: e.target.checked, kasbon_deduction: e.target.checked ? Math.min(activeBalance, row.kasbon_deduction || activeBalance) : 0 })} /> Potong</label><input type="number" value={row.kasbon_deduction} onChange={(e) => updateRow({ kasbon_deduction: cleanNumber(e.target.value), potong_kasbon: cleanNumber(e.target.value) > 0 })} /></td>
+                    <td className="money">{formatIDR(calc.takeHome, store.business_settings.currency)}</td>
+                    <td className="row-actions"><button className="icon" onClick={() => setDetailRowId(row.employee_internal_id)}><Eye size={15} /></button><button className="icon" onClick={() => finalizeMonthlyRow(row)}><Save size={15} /></button></td>
+                  </tr>;
+                })}</tbody>
+              </table>
             </div>
-            <div className="component-split">
-              <ComponentAmountTable title="Pendapatan" type="earning" components={generatedComponents} custom={customComponents} setCustom={setCustomComponents} amounts={componentAmounts} setAmounts={setComponentAmounts} currency={store.business_settings.currency} />
-              <ComponentAmountTable title="Potongan" type="deduction" components={generatedComponents} custom={customComponents} setCustom={setCustomComponents} amounts={componentAmounts} setAmounts={setComponentAmounts} currency={store.business_settings.currency} />
-            </div>
-            <button className="ghost" onClick={addCustomComponent}><Plus size={16} /> Tambah Komponen Sekali Pakai</button>
-            <div className="summary-bar">
-              <span>Total Pendapatan <strong>{formatIDR(totals.total_earning, store.business_settings.currency)}</strong></span>
-              <span>Total Potongan <strong>{formatIDR(totals.total_deduction, store.business_settings.currency)}</strong></span>
-              <span>Take Home Pay <strong>{formatIDR(totals.take_home_pay, store.business_settings.currency)}</strong></span>
-            </div>
+            {!payrollRowsDraft.length && <Empty title="Klik Generate / Load Payroll untuk membuat payroll bulanan dari default staff." />}
           </section>
         )}
 
@@ -1294,6 +1743,23 @@ function App() {
                   <StatusBadge status={selectedSavedSlip.status} />
                   <h3>{selectedSavedSlip.slip_id}</h3>
                   <p>{selectedSavedSlip.employee_name} | {months[selectedSavedSlip.month - 1]} {selectedSavedSlip.year}</p>
+                  {(() => {
+                    const payment = JSON.parse(selectedSavedSlip.payment_snapshot_json);
+                    const employee = JSON.parse(selectedSavedSlip.employee_snapshot_json) as Employee;
+                    const detail = payment.payroll_detail as PayrollDraftRow | undefined;
+                    const calc = payment.calculation as ReturnType<typeof calculatePayrollRow> | undefined;
+                    if (!detail || !calc) return null;
+                    return <div className="review-breakdown">
+                      <h3>{selectedSavedSlip.employee_name}</h3>
+                      <p><strong>Gaji Pokok:</strong> {formatIDR(employee.base_salary_monthly || employee.default_salary, store.business_settings.currency)} - ({calc.unpaidDays} hari tidak dibayar x {formatIDR(calc.dailySalary, store.business_settings.currency)}) = {formatIDR(calc.finalBase, store.business_settings.currency)}</p>
+                      <p><strong>Uang Makan:</strong> {detail.hari_masuk} hari masuk x {formatIDR(employee.meal_allowance_per_day, store.business_settings.currency)} = {formatIDR(calc.meal, store.business_settings.currency)}</p>
+                      <p><strong>Transport:</strong> {detail.hari_masuk} hari masuk x {formatIDR(employee.transport_allowance_per_day, store.business_settings.currency)} = {formatIDR(calc.transport, store.business_settings.currency)}</p>
+                      <p><strong>Komisi:</strong> {formatIDR(detail.komisi, store.business_settings.currency)} | <strong>Bonus:</strong> {formatIDR(detail.bonus, store.business_settings.currency)} | <strong>Lembur:</strong> {formatIDR(detail.lembur, store.business_settings.currency)}</p>
+                      <p><strong>Potongan:</strong> Kasbon {formatIDR(detail.potong_kasbon ? detail.kasbon_deduction : 0, store.business_settings.currency)} • Potongan Manual {formatIDR(detail.potongan_manual, store.business_settings.currency)}</p>
+                      <h3>Take Home Pay: {formatIDR(calc.takeHome, store.business_settings.currency)}</h3>
+                      <div className="actions"><span className="badge finalized">Draft</span>{detail.manual_override && <span className="badge pending">Manual Override</span>}{detail.potong_kasbon && <span className="badge approved">Kasbon Deducted</span>}<span className="badge active">Ready to Finalize</span></div>
+                    </div>;
+                  })()}
                 </div>
                 <div className="actions">
                   <button className="ghost" onClick={() => openSavedPdf(selectedSavedSlip)}><Eye size={16} /> Pratinjau PDF</button>
@@ -1328,7 +1794,7 @@ function App() {
                 <Input label="Dari" type="date" value={recapFrom} onChange={setRecapFrom} />
                 <Input label="Sampai" type="date" value={recapTo} onChange={setRecapTo} />
                 <label>Karyawan<select value={recapEmployee} onChange={(e) => setRecapEmployee(e.target.value)}><option value="">Semua</option>{store.employees.map((e) => <option key={e.id} value={e.employee_id}>{e.name}</option>)}</select></label>
-                <label>Status<select value={recapStatus} onChange={(e) => setRecapStatus(e.target.value)}><option value="">Semua</option>{["hadir", "telat", "izin", "sakit", "alfa", "libur"].map((s) => <option key={s} value={s}>{statusLabel(s as AttendanceStatus)}</option>)}</select></label>
+                <label>Status<select value={recapStatus} onChange={(e) => setRecapStatus(e.target.value)}><option value="">Semua</option>{attendanceStatusOptions.map((s) => <option key={s} value={s}>{statusLabel(s)}</option>)}</select></label>
               </div>
             </div>
             <AttendanceStats logs={filteredAttendance(store.attendance_logs, recapFrom, recapTo, recapEmployee, recapStatus)} />
@@ -1396,7 +1862,7 @@ function App() {
         {adminUnlocked && page === "Settings" && (
           <section className="settings-layout">
             <div className="tabs">
-              {["Info Bisnis", "Komponen Payroll", "Pengaturan PDF"].map((tab) => <button key={tab} className={settingsTab === tab ? "active" : ""} onClick={() => setSettingsTab(tab)}>{tab}</button>)}
+              {["Info Bisnis", "Absensi Settings", "Komponen Payroll", "Pengaturan PDF"].map((tab) => <button key={tab} className={settingsTab === tab ? "active" : ""} onClick={() => setSettingsTab(tab)}>{tab}</button>)}
             </div>
             {settingsTab === "Info Bisnis" && (
               <div className="panel">
@@ -1412,6 +1878,31 @@ function App() {
                   <label>Upload Logo<input type="file" accept="image/*" onChange={(e) => readLogo(e.target.files?.[0], (logo_data_url) => updateBusiness({ logo_data_url }))} /></label>
                   <div className="logo-preview">{store.business_settings.logo_data_url ? <img src={store.business_settings.logo_data_url} alt="" /> : <span>Pratinjau logo</span>}</div>
                 </div>
+              </div>
+            )}
+            {settingsTab === "Absensi Settings" && (
+              <div className="panel">
+                <div className="section-head">
+                  <div>
+                    <h2>QR Absensi Kantor</h2>
+                    <p className="muted">Untuk mencegah titip absen, gunakan QR Harian + PIN Staff. QR harian berubah setiap hari dan PIN staff wajib diisi saat absen.</p>
+                  </div>
+                  <span className="badge active">{store.business_settings.attendance_qr_mode === "daily" ? "QR Harian" : "Static Office QR"}</span>
+                </div>
+                <div className="form-grid">
+                  <label>QR Mode<select value={store.business_settings.attendance_qr_mode} onChange={(e) => updateBusiness({ attendance_qr_mode: e.target.value as "static" | "daily" })}><option value="daily">QR Harian</option><option value="static">Static Office QR</option></select></label>
+                  <label>QR validity<input readOnly value={store.business_settings.attendance_qr_mode === "daily" ? "Valid today only" : "Static"} /></label>
+                </div>
+                <div className="actions">
+                  <button className="primary" onClick={() => generateOfficeQr(false)}><QrCode size={16} /> Generate QR</button>
+                  <button className="ghost" onClick={() => generateOfficeQr(true)}><RotateCcw size={16} /> Regenerate QR</button>
+                  <button className="ghost" onClick={() => downloadOfficeQr(false)}><Download size={16} /> Download QR</button>
+                  <button className="ghost" onClick={() => downloadOfficeQr(true)}><Printer size={16} /> Print QR</button>
+                </div>
+                <div className="office-qr-preview">
+                  {officeQrDataUrl ? <img src={officeQrDataUrl} alt="" /> : <span>Office QR Code akan tampil setelah Generate QR.</span>}
+                </div>
+                <p className="helper-text">Rekomendasi: gunakan QR Harian Kantor + PIN Staff untuk mengurangi risiko titip absen.</p>
               </div>
             )}
             {settingsTab === "Komponen Payroll" && (
@@ -1433,7 +1924,7 @@ function App() {
                 <div className="form-grid">
                   <label className="full">Catatan Footer Default<textarea value={store.business_settings.footer_note} onChange={(e) => updateBusiness({ footer_note: e.target.value })} /></label>
                   <label className="full">Catatan Pembayaran Default<textarea value={store.business_settings.payment_note} onChange={(e) => updateBusiness({ payment_note: e.target.value })} /></label>
-                  <Input label="PIN Admin (placeholder, default 0987)" value={store.business_settings.admin_pin} onChange={(v) => updateBusiness({ admin_pin: v || "0987" })} />
+                  <p className="helper-text full">PIN Admin disimpan internal dan tidak ditampilkan di UI. Perubahan PIN admin akan dibuat melalui panel keamanan terpisah.</p>
                 </div>
               </div>
             )}
@@ -1453,6 +1944,21 @@ function emptyEmployee(employeeId = "EMP001"): Employee {
     position: "Admin",
     active: true,
     default_salary: 0,
+    base_salary_monthly: 0,
+    meal_allowance_per_day: 10000,
+    transport_allowance_per_day: 0,
+    work_days_per_month: 26,
+    leave_quota_monthly: 0,
+    leave_quota_yearly: 0,
+    bpjs_kesehatan_default: 0,
+    bpjs_ketenagakerjaan_default: 0,
+    fixed_allowance: 0,
+    hp_admin_allowance_enabled: false,
+    hp_admin_allowance_amount: 0,
+    bank_name: "",
+    account_number: "",
+    account_holder: "",
+    staff_pin: randomPin(),
     attendance_token: "",
     notes: "",
     created_at: now(),
@@ -1478,6 +1984,15 @@ function Metric(props: { title: string; value: number; icon: React.ReactNode }) 
   return <div className="metric"><div>{props.icon}</div><span>{props.title}</span><strong>{props.value}</strong></div>;
 }
 
+function Breakdown({ title, rows }: { title: string; rows: [string, string][] }) {
+  return (
+    <div className="breakdown">
+      <h3>{title}</h3>
+      {rows.map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong></div>)}
+    </div>
+  );
+}
+
 function Empty({ title }: { title: string }) {
   return <div className="empty"><Archive size={32} /><p>{title}</p></div>;
 }
@@ -1498,8 +2013,10 @@ function StatusBadge({ status }: { status: RowStatus }) {
 }
 
 function statusLabel(status: AttendanceStatus) {
-  return ({ hadir: "Hadir", telat: "Telat", izin: "Izin", sakit: "Sakit", alfa: "Alfa", libur: "Libur" })[status];
+  return ({ hadir: "Hadir", telat: "Telat", cuti_berbayar: "Cuti Berbayar", cuti_tidak_berbayar: "Cuti Tidak Berbayar", izin: "Izin", sakit: "Sakit", alfa: "Alfa", libur: "Libur" })[status];
 }
+
+const attendanceStatusOptions: AttendanceStatus[] = ["hadir", "telat", "cuti_berbayar", "cuti_tidak_berbayar", "izin", "sakit", "alfa", "libur"];
 
 function filteredAttendance(logs: AttendanceLog[], from: string, to: string, employee: string, status: string) {
   return logs.filter((log) =>
@@ -1513,7 +2030,7 @@ function filteredAttendance(logs: AttendanceLog[], from: string, to: string, emp
 function AttendanceStats({ logs }: { logs: AttendanceLog[] }) {
   return (
     <div className="summary-bar attendance-stats">
-      {(["hadir", "telat", "izin", "sakit", "alfa", "libur"] as AttendanceStatus[]).map((status) => (
+      {attendanceStatusOptions.map((status) => (
         <span key={status}>{statusLabel(status)} <strong>{logs.filter((log) => log.status === status).length}</strong></span>
       ))}
       <span>Total lembur <strong>{logs.reduce((sum, log) => sum + log.overtime_minutes, 0)} menit</strong></span>
@@ -1535,7 +2052,7 @@ function AttendanceTable(props: { logs: AttendanceLog[]; editable: boolean; onUp
             <td>{log.clock_in_time || "-"}</td>
             <td>{log.clock_out_time || "-"}</td>
             <td>{Math.round(log.total_work_minutes / 60 * 10) / 10} jam</td>
-            <td>{props.editable ? <select value={log.status} onChange={(e) => props.onUpdate(log, { status: e.target.value as AttendanceStatus })}>{(["hadir", "telat", "izin", "sakit", "alfa", "libur"] as AttendanceStatus[]).map((status) => <option key={status} value={status}>{statusLabel(status)}</option>)}</select> : statusLabel(log.status)}</td>
+            <td>{props.editable ? <select value={log.status} onChange={(e) => props.onUpdate(log, { status: e.target.value as AttendanceStatus })}>{attendanceStatusOptions.map((status) => <option key={status} value={status}>{statusLabel(status)}</option>)}</select> : statusLabel(log.status)}</td>
             <td>{props.editable ? <input value={log.notes} onChange={(e) => props.onUpdate(log, { notes: e.target.value })} /> : log.notes || "-"}</td>
           </tr>
         ))}</tbody>
@@ -1588,6 +2105,7 @@ function ComponentEditor(props: { component: PayrollComponent; onSave: (componen
         <label>Tipe<select value={draft.type} onChange={(e) => setDraft({ ...draft, type: e.target.value as ComponentType })}><option value="earning">Pendapatan</option><option value="deduction">Potongan</option></select></label>
         <Input label="Nominal default" type="number" value={draft.default_amount} onChange={(v) => setDraft({ ...draft, default_amount: cleanNumber(v) })} />
         <Input label="Urutan" type="number" value={draft.sort_order} onChange={(v) => setDraft({ ...draft, sort_order: cleanNumber(v) })} />
+        <label>Kategori<select value={draft.category || "Monthly Variable"} onChange={(e) => setDraft({ ...draft, category: e.target.value as PayrollComponent["category"] })}><option>Default Staff</option><option>Monthly Variable</option><option>Deduction</option><option>Allowance</option></select></label>
         <Toggle label="Aktif" checked={draft.active} onChange={(v) => setDraft({ ...draft, active: v })} />
         <Toggle label="Tampil di form payroll" checked={draft.show_in_form} onChange={(v) => setDraft({ ...draft, show_in_form: v })} />
         <Toggle label="Tampil di PDF" checked={draft.show_in_pdf} onChange={(v) => setDraft({ ...draft, show_in_pdf: v })} />

@@ -352,6 +352,119 @@ textarea {
   border-radius: 8px;
 }
 
+.qr-preview.large {
+  width: 220px;
+  height: 220px;
+  margin: 8px auto;
+}
+
+.salary-mini-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(180px, 1fr));
+  gap: 8px;
+}
+
+.salary-mini-grid span,
+.pin-line {
+  padding: 8px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: white;
+}
+
+.office-qr-preview {
+  min-height: 260px;
+  display: grid;
+  place-items: center;
+  margin-top: 16px;
+  border: 1px dashed #94a3b8;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #64748b;
+}
+
+.office-qr-preview img {
+  width: 240px;
+  height: 240px;
+}
+
+.info-strip {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin: 16px 0;
+}
+
+.info-strip span {
+  padding: 10px;
+  border: 1px solid #dbeafe;
+  border-radius: 8px;
+  color: #1e3a8a;
+  background: #eff6ff;
+  font-weight: 700;
+}
+
+.payroll-table-wrap {
+  overflow-x: auto;
+  margin-top: 16px;
+}
+
+.payroll-table {
+  min-width: 1500px;
+}
+
+.payroll-table input {
+  min-width: 88px;
+  padding: 7px;
+}
+
+.sticky-col {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  background: white;
+  min-width: 210px;
+}
+
+.compact-toggle {
+  min-height: auto;
+  white-space: nowrap;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.breakdown {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.breakdown div {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) 1.2fr;
+  gap: 8px;
+  align-items: start;
+}
+
+.breakdown span {
+  color: #64748b;
+}
+
+.review-breakdown {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid #e2e8f0;
+}
+
 .component-split {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -724,9 +837,11 @@ th {
   .two,
   .component-split,
   .summary-bar,
+  .info-strip,
   .attendance-stats,
   .today-status,
   .payroll-reminders,
+  .detail-grid,
   .form-grid.four {
     grid-template-columns: 1fr;
   }
@@ -750,6 +865,10 @@ th {
   }
 
   .amount-row {
+    grid-template-columns: 1fr;
+  }
+
+  .salary-mini-grid {
     grid-template-columns: 1fr;
   }
 
