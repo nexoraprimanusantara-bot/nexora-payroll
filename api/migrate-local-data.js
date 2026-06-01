@@ -33,12 +33,31 @@ export default async function handler(req, res) {
     let employees = 0;
     let attendance = 0;
     let extraWork = 0;
+    let businessInfo = 0;
 
     if (data.business_settings) {
       await sql`
-        insert into business_settings (id, data, updated_at)
-        values ('default', ${JSON.stringify(data.business_settings)}::jsonb, now())
-        on conflict (id) do update set data = excluded.data, updated_at = now()
+        insert into business_settings (
+          id, data, business_name, business_subtitle, business_address,
+          business_phone, business_email, business_logo_url, payslip_footer_note, updated_at
+        )
+        values (
+          'default', ${JSON.stringify(data.business_settings)}::jsonb,
+          ${data.business_settings.business_name || "Nama Bisnis"}, 'Aplikasi Penggajian',
+          ${data.business_settings.address || ""}, ${data.business_settings.phone || ""},
+          ${data.business_settings.email || ""}, ${data.business_settings.logo_data_url || ""},
+          ${data.business_settings.footer_note || ""}, now()
+        )
+        on conflict (id) do update set
+          data = excluded.data,
+          business_name = excluded.business_name,
+          business_subtitle = excluded.business_subtitle,
+          business_address = excluded.business_address,
+          business_phone = excluded.business_phone,
+          business_email = excluded.business_email,
+          business_logo_url = excluded.business_logo_url,
+          payslip_footer_note = excluded.payslip_footer_note,
+          updated_at = now()
       `;
       await sql`
         update attendance_settings set
@@ -52,6 +71,7 @@ export default async function handler(req, res) {
           updated_at = now()
         where id = 'default'
       `;
+      businessInfo = 1;
     }
 
     for (const employee of data.employees || []) {
@@ -109,7 +129,7 @@ export default async function handler(req, res) {
       }
     }
 
-    return json(res, 200, { ok: true, summary: { employees, attendance, extraWork } });
+    return json(res, 200, { ok: true, summary: { employees, attendance, extraWork, businessInfo } });
   } catch (error) {
     return handleError(res, error);
   }

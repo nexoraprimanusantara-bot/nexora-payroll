@@ -13,17 +13,24 @@ export default async function handler(req, res) {
     const sql = getSql();
     const body = await readBody(req);
     const [settings] = await sql`select * from attendance_settings where id = 'default'`;
-    if (!body.officeToken || settings.office_token !== body.officeToken) {
-      return json(res, 200, { ok: false, code: "INVALID_QR", message: "QR kantor tidak valid. Silakan scan QR resmi dari kantor." });
-    }
     const [employee] = await sql`select * from employees where employee_id = ${body.employeeId} and active = true`;
     if (!employee) return json(res, 404, { ok: false, code: "EMPLOYEE_NOT_FOUND", message: "Karyawan tidak ditemukan atau tidak aktif." });
-    if (!employee.staff_pin || employee.staff_pin !== body.staffPin) {
-      return json(res, 401, { ok: false, code: "INVALID_PIN", message: "PIN Staff salah. Silakan coba lagi." });
-    }
 
     const date = body.date || new Date().toISOString().slice(0, 10);
     const time = body.time || new Date().toTimeString().slice(0, 5);
+    await sql`
+      update attendance_logs set
+        forgot_clock_out = true,
+        auto_closed_at = now(),
+        status_note = 'Lupa sign out / clock out',
+        admin_review_required = true,
+        updated_at = now()
+      where employee_id = ${employee.employee_id}
+        and date < ${date}
+        and nullif(clock_in_time, '') is not null
+        and (clock_out_time is null or clock_out_time = '')
+        and coalesce(forgot_clock_out, false) = false
+    `;
     const [existing] = await sql`select * from attendance_logs where employee_id = ${employee.employee_id} and date = ${date}`;
 
     if (body.action === "clock_in") {
@@ -38,7 +45,7 @@ export default async function handler(req, res) {
         ) values (
           ${id}, ${employee.employee_id}, ${employee.name}, ${date}, ${time}, 'hadir',
           ${settings.qr_mode === "daily" ? "daily" : "office_static"}, ${body.qrDate || date},
-          true, true, 'qr', ${body.location?.lat ?? null}, ${body.location?.lng ?? null},
+          true, false, 'qr', ${body.location?.lat ?? null}, ${body.location?.lng ?? null},
           ${body.location?.accuracy ?? null}, ${body.location?.distance ?? null},
           ${body.location?.valid ?? null}, ${body.location?.status || null},
           ${body.notes || ""}, now(), now()
@@ -46,7 +53,6 @@ export default async function handler(req, res) {
         on conflict (employee_id, date) do update set
           clock_in_time = coalesce(attendance_logs.clock_in_time, excluded.clock_in_time),
           office_token_valid = true,
-          pin_verified = true,
           updated_at = now()
         returning *
       `;
@@ -63,7 +69,6 @@ export default async function handler(req, res) {
           clock_out_time = ${time},
           total_work_minutes = ${total},
           overtime_minutes = ${overtime},
-          pin_verified = true,
           location_lat = coalesce(${body.location?.lat ?? null}, location_lat),
           location_lng = coalesce(${body.location?.lng ?? null}, location_lng),
           location_accuracy = coalesce(${body.location?.accuracy ?? null}, location_accuracy),

@@ -33,13 +33,15 @@ import QRCode from "qrcode";
 import {
   bootstrapData,
   clockAttendanceRemote,
+  fetchBusinessSettings,
   migrateLocalDataToNeon,
+  saveBusinessSettings,
   saveAttendanceSettings,
   saveEmployeeRemote,
   saveExtraWorkRemote,
+  syncEmployeesRemote,
   syncStoreToRemote,
   updateExtraWorkRemote,
-  validateOfficeQrRemote,
 } from "./services/dataStore";
 import "./styles.css";
 
@@ -201,6 +203,10 @@ type AttendanceLog = {
   office_distance_meters?: number;
   location_valid?: boolean;
   location_validation_status?: "valid" | "outside_radius" | "denied" | "unavailable" | "not_configured";
+  forgot_clock_out?: boolean;
+  auto_closed_at?: string;
+  status_note?: string;
+  admin_review_required?: boolean;
   created_at: string;
   updated_at: string;
 };
@@ -290,15 +296,9 @@ const monthEnd = (month: number, year: number) => new Date(year, month, 0).toISO
 const makeAttendanceToken = (employeeId: string) => `ATT-${employeeId}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 const randomPin = () => String(Math.floor(1000 + Math.random() * 9000));
 const makeOfficeQrToken = () => `OFFICE-${crypto.randomUUID().slice(0, 12).toUpperCase()}`;
-const attendanceLink = (settings: BusinessSettings, date = today()) => {
+const attendanceLink = (_settings?: BusinessSettings, _date = today()) => {
   const base = `${window.location.origin}${window.location.pathname}`;
-  const params = new URLSearchParams({
-    mode: "checkin",
-    officeToken: settings.office_qr_token,
-    qrType: settings.attendance_qr_mode === "daily" ? "daily" : "office_static",
-  });
-  if (settings.attendance_qr_mode === "daily") params.set("qrDate", date);
-  return `${base}#/absensi-staff?${params.toString()}`;
+  return `${base}?attendance=staff`;
 };
 
 const officeQrPayload = (settings: BusinessSettings, date = today()) => attendanceLink(settings, date);
@@ -314,6 +314,7 @@ function getQueryParam(name: string) {
 
 function readAttendanceParams() {
   return {
+    attendance: getQueryParam("attendance") || "",
     mode: getQueryParam("mode") || "",
     officeToken: getQueryParam("officeToken") || "",
     qrType: getQueryParam("qrType") || "office_static",
@@ -855,11 +856,9 @@ function App() {
   const [attendanceEmployeeId, setAttendanceEmployeeId] = useState("");
   const [attendanceSource, setAttendanceSource] = useState<"qr" | "manual">("qr");
   const [attendanceQrInput, setAttendanceQrInput] = useState("");
-  const [attendanceOfficeToken, setAttendanceOfficeToken] = useState("");
   const [attendanceQrValid, setAttendanceQrValid] = useState(false);
   const [attendanceQrType, setAttendanceQrType] = useState<"office_static" | "daily">("office_static");
   const [isCheckInMode, setIsCheckInMode] = useState(false);
-  const [qrValidationAttempted, setQrValidationAttempted] = useState(false);
   const [showManualQr, setShowManualQr] = useState(false);
   const [adminCorrectionOpen, setAdminCorrectionOpen] = useState(false);
   const [clockNow, setClockNow] = useState(new Date());
@@ -871,7 +870,6 @@ function App() {
     distance?: number;
     message: string;
   }>({ status: "not_configured", message: "Validasi lokasi tidak aktif" });
-  const [staffPinInput, setStaffPinInput] = useState("");
   const [manualAdminPin, setManualAdminPin] = useState("");
   const [officeQrDataUrl, setOfficeQrDataUrl] = useState("");
   const [attendanceMessage, setAttendanceMessage] = useState("");
@@ -908,7 +906,7 @@ function App() {
   const [databaseOffline, setDatabaseOffline] = useState(false);
   const [databaseMessage, setDatabaseMessage] = useState("");
 
-  const saveStore = (next: Store, syncRemote = true) => {
+  const saveStore = (next: Store, syncRemote = false) => {
     setStore(next);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
     if (syncRemote) {
@@ -1018,76 +1016,26 @@ function App() {
     );
   };
 
-  const validateOfficeQr = async (raw = attendanceQrInput) => {
-    setQrValidationAttempted(true);
-    const payload = extractOfficeQr(raw);
-    try {
-      if (!payload.token) {
-        setAttendanceQrValid(false);
-        setAttendanceMessage("QR kantor tidak valid. Silakan scan QR resmi dari kantor.");
-        return false;
-      }
-      const remote = await validateOfficeQrRemote(payload.token);
-      if (remote.ok) {
-        setDatabaseOffline(false);
-        setDatabaseMessage("");
-        if (!remote.data.valid) {
-          setAttendanceQrValid(false);
-          setAttendanceMessage("QR kantor tidak valid. Silakan scan QR resmi dari kantor.");
-          return false;
-        }
-        setAttendanceQrValid(true);
-        setAttendanceOfficeToken(payload.token);
-        setAttendanceQrType(remote.data.qr_type === "daily" ? "daily" : "office_static");
-        setAttendanceSource("qr");
-        setAttendanceMessage(remote.data.qr_type === "daily" ? "QR hari ini valid." : "QR Kantor valid.");
-        requestLocation();
-        return true;
-      }
-      setDatabaseOffline(remote.offline);
-      if (remote.offline && payload.token !== store.business_settings.office_qr_token) {
-        setAttendanceQrValid(false);
-        setAttendanceMessage("Database belum tersambung. Hubungi admin.");
-        return false;
-      }
-      if (payload.type === "daily" && payload.date !== today()) {
-        setAttendanceQrValid(false);
-        setAttendanceMessage("QR absensi sudah tidak berlaku. Silakan scan QR hari ini.");
-        return false;
-      }
-      setAttendanceQrValid(true);
-      setAttendanceOfficeToken(payload.token);
-      setAttendanceQrType(payload.type === "office_static" ? "office_static" : "daily");
-      setAttendanceSource("qr");
-      setAttendanceMessage(payload.type === "daily" ? "QR hari ini valid." : "QR Kantor valid.");
-      requestLocation();
-      return true;
-    } catch {
-      setAttendanceQrValid(false);
-      setAttendanceMessage("QR kantor tidak valid. Silakan scan QR resmi dari kantor.");
-      return false;
-    }
+  const openManualAttendanceLink = () => {
+    const link = attendanceQrInput.trim() || attendanceLink(store.business_settings);
+    window.location.href = link.includes("attendance=staff") ? link : attendanceLink(store.business_settings);
   };
 
   useEffect(() => {
     const handleAttendanceRoute = () => {
       const params = readAttendanceParams();
-      if (params.mode !== "checkin") {
+      const staffMode = params.attendance === "staff";
+      if (!staffMode) {
         setIsCheckInMode(false);
-        setQrValidationAttempted(false);
         setAttendanceQrValid(false);
         return;
       }
       setIsCheckInMode(true);
+      setAttendanceQrValid(true);
+      setAttendanceSource("qr");
       setShowManualQr(false);
       setAdminCorrectionOpen(false);
-      if (params.officeToken) {
-        validateOfficeQr(window.location.href);
-        return;
-      }
-      setQrValidationAttempted(true);
-      setAttendanceQrValid(false);
-      setAttendanceMessage("QR kantor tidak valid. Silakan scan QR resmi dari kantor.");
+      requestLocation();
     };
     handleAttendanceRoute();
     window.addEventListener("hashchange", handleAttendanceRoute);
@@ -1200,18 +1148,33 @@ function App() {
     status: locationState.status,
   });
 
+  const markForgotClockOutLocally = (logs: AttendanceLog[], employeeId: string) => {
+    let changed = false;
+    const nextLogs = logs.map((log) => {
+      if (log.employee_id === employeeId && log.date < today() && log.clock_in_time && !log.clock_out_time && !log.forgot_clock_out) {
+        changed = true;
+        return {
+          ...log,
+          forgot_clock_out: true,
+          auto_closed_at: now(),
+          status_note: "Lupa sign out / clock out",
+          admin_review_required: true,
+          updated_at: now(),
+        };
+      }
+      return log;
+    });
+    return { logs: nextLogs, changed };
+  };
+
   const clockIn = async () => {
     if (!attendanceEmployee) return alert("Pilih atau masukkan Employee ID yang valid.");
     if (!attendanceEmployee.active) return alert("Karyawan tidak aktif.");
-    if (!adminCorrectionOpen && !attendanceQrValid) return alert("Scan QR Absensi Kantor yang valid terlebih dahulu.");
     if (adminCorrectionOpen && manualAdminPin !== (store.business_settings.admin_pin || "0987")) return alert("Manual fallback memerlukan PIN admin.");
-    if (attendanceEmployee.staff_pin !== staffPinInput) return alert("PIN Staff salah. Silakan coba lagi.");
     if (todayAttendance?.clock_in_time) return alert("Karyawan ini sudah clock in hari ini.");
     if (!adminCorrectionOpen) {
       const remote = await clockAttendanceRemote({
-        officeToken: attendanceOfficeToken || store.business_settings.office_qr_token,
         employeeId: attendanceEmployee.employee_id,
-        staffPin: staffPinInput,
         action: "clock_in",
         date: today(),
         time: currentTime(),
@@ -1232,6 +1195,7 @@ function App() {
       setDatabaseOffline(true);
       setDatabaseMessage("Database offline, menggunakan data lokal");
     }
+    const forgot = markForgotClockOutLocally(store.attendance_logs, attendanceEmployee.employee_id);
     const log: AttendanceLog = {
       id: uid("attendance"),
       employee_id: attendanceEmployee.employee_id,
@@ -1249,7 +1213,7 @@ function App() {
       source: adminCorrectionOpen ? "manual" : "qr",
       qr_type: adminCorrectionOpen ? undefined : attendanceQrType,
       qr_date: adminCorrectionOpen ? "" : today(),
-      pin_verified: attendanceEmployee.staff_pin === staffPinInput,
+      pin_verified: false,
       location_lat: locationState.lat,
       location_lng: locationState.lng,
       location_accuracy: locationState.accuracy,
@@ -1259,22 +1223,19 @@ function App() {
       created_at: now(),
       updated_at: now(),
     };
-    saveStore({ ...store, attendance_logs: [log, ...store.attendance_logs] });
-    setAttendanceMessage(`Clock In berhasil pukul ${log.clock_in_time}`);
+    saveStore({ ...store, attendance_logs: [log, ...forgot.logs] });
+    if (forgot.changed) setAttendanceMessage(`Clock In berhasil pukul ${log.clock_in_time}. Kemarin ada absensi yang belum Clock Out dan sudah ditandai sebagai lupa sign out.`);
+    else setAttendanceMessage(`Clock In berhasil pukul ${log.clock_in_time}`);
   };
 
   const clockOut = async () => {
     if (!attendanceEmployee || !todayAttendance) return alert("Clock in terlebih dahulu.");
-    if (!adminCorrectionOpen && !attendanceQrValid) return alert("Scan QR Absensi Kantor yang valid terlebih dahulu.");
     if (adminCorrectionOpen && manualAdminPin !== (store.business_settings.admin_pin || "0987")) return alert("Manual fallback memerlukan PIN admin.");
-    if (attendanceEmployee.staff_pin !== staffPinInput) return alert("PIN Staff salah. Silakan coba lagi.");
     if (todayAttendance.clock_out_time) return alert("Karyawan ini sudah clock out hari ini.");
     const out = currentTime();
     if (!adminCorrectionOpen) {
       const remote = await clockAttendanceRemote({
-        officeToken: attendanceOfficeToken || store.business_settings.office_qr_token,
         employeeId: attendanceEmployee.employee_id,
-        staffPin: staffPinInput,
         action: "clock_out",
         date: today(),
         time: out,
@@ -1321,6 +1282,7 @@ function App() {
   const submitExtraWork = (none = false) => {
     if (none || !showExtraPrompt) {
       setShowExtraPrompt(null);
+      if (none) setAttendanceMessage("Absensi hari ini selesai.");
       return;
     }
     const records: ExtraWorkRecord[] = [];
@@ -1371,7 +1333,7 @@ function App() {
     setShowExtraPrompt(null);
     setExtraChoice("none");
     setExtraDraft({ overtime_hours: 0, overtime_amount: 0, overtime_notes: "", chore_name: "", chore_quantity: 0, chore_amount: 0, chore_notes: "" });
-    setAttendanceMessage("Pengajuan lembur / extra chore berhasil dikirim dan menunggu approval admin.");
+    setAttendanceMessage("Catatan lembur / extra chore berhasil dikirim dan menunggu review admin.");
   };
 
   const setExtraStatus = (record: ExtraWorkRecord, status: ApprovalStatus) => {
@@ -1470,11 +1432,13 @@ function App() {
   const todayAttendance = attendanceEmployee
     ? store.attendance_logs.find((log) => log.employee_id === attendanceEmployee.employee_id && log.date === today())
     : undefined;
-  const staffPinValid = Boolean(attendanceEmployee && staffPinInput && attendanceEmployee.staff_pin === staffPinInput);
-  const attendanceCanContinue = attendanceQrValid || adminCorrectionOpen;
+  const previousUnclosedAttendance = attendanceEmployee
+    ? store.attendance_logs.find((log) => log.employee_id === attendanceEmployee.employee_id && log.date < today() && log.clock_in_time && !log.clock_out_time && !log.forgot_clock_out)
+    : undefined;
+  const attendanceCanContinue = isCheckInMode || adminCorrectionOpen;
   const locationBlocksAttendance = store.business_settings.location_validation_enabled && store.business_settings.location_validation_mode === "block" && !["valid", "not_configured"].includes(locationState.status);
-  const attendanceReady = Boolean(attendanceCanContinue && attendanceEmployee?.active && staffPinValid && !locationBlocksAttendance);
-  const attendanceMessageIsError = attendanceMessage.includes("tidak valid") || attendanceMessage.includes("tidak berlaku") || attendanceMessage.includes("salah");
+  const attendanceReady = Boolean(attendanceCanContinue && attendanceEmployee?.active && !locationBlocksAttendance);
+  const attendanceMessageIsError = attendanceMessage.includes("offline") || attendanceMessage.includes("gagal") || attendanceMessage.includes("belum tersambung");
   const activeKasbon = selectedEmployee
     ? store.employee_cash_advances.filter((kasbon) => kasbon.employee_id === selectedEmployee.employee_id && ["active", "partially_paid"].includes(kasbon.status) && kasbon.remaining_balance > 0)
     : [];
@@ -1490,11 +1454,54 @@ function App() {
 
   const updateBusiness = (patch: Partial<BusinessSettings>) => {
     const nextSettings = { ...store.business_settings, ...patch, updated_at: now() };
-    saveStore({ ...store, business_settings: nextSettings });
-    saveAttendanceSettings(nextSettings as unknown as Record<string, unknown>).then((result) => {
+    saveStore({ ...store, business_settings: nextSettings }, false);
+    const attendanceKeys = ["attendance_qr_mode", "office_qr_token", "location_validation_enabled", "office_latitude", "office_longitude", "location_radius_meters", "location_validation_mode"];
+    const sync = Object.keys(patch).some((key) => attendanceKeys.includes(key))
+      ? saveAttendanceSettings(nextSettings as unknown as Record<string, unknown>)
+      : saveBusinessSettings(nextSettings as unknown as Record<string, unknown>);
+    sync.then((result) => {
       setDatabaseOffline(!result.ok && result.offline);
       if (!result.ok && result.offline) setDatabaseMessage("Database offline, menggunakan data lokal");
+      if (result.ok && "message" in result.data && result.data.message) setDatabaseMessage(String(result.data.message));
     });
+  };
+
+  const refreshBusinessFromDatabase = async () => {
+    const result = await fetchBusinessSettings();
+    if (!result.ok) {
+      setDatabaseOffline(result.offline);
+      setDatabaseMessage(result.offline ? "Database offline, menggunakan data lokal" : result.error);
+      return;
+    }
+    const business = (result.data.business_settings || {}) as Partial<BusinessSettings>;
+    const next = { ...store, business_settings: { ...store.business_settings, ...business } };
+    saveStore(next, false);
+    setDatabaseOffline(false);
+    setDatabaseMessage("Business Info berhasil dimuat dari database.");
+  };
+
+  const syncBusinessInfo = async () => {
+    const result = await saveBusinessSettings(store.business_settings as unknown as Record<string, unknown>);
+    if (!result.ok) {
+      setDatabaseOffline(result.offline);
+      setDatabaseMessage(result.offline ? "Database offline, menggunakan data lokal" : result.error);
+      return;
+    }
+    setDatabaseOffline(false);
+    setDatabaseMessage("Business Info berhasil disimpan ke database.");
+    alert("Business Info berhasil disimpan ke database.");
+  };
+
+  const syncStaffToNeon = async () => {
+    const result = await syncEmployeesRemote(store.employees as unknown as Array<Record<string, unknown>>);
+    if (!result.ok) {
+      setDatabaseOffline(result.offline);
+      setDatabaseMessage(result.offline ? "Database offline, menggunakan data lokal" : result.error);
+      alert(result.offline ? "Database belum tersambung. Cek DATABASE_URL." : result.error);
+      return;
+    }
+    setDatabaseOffline(false);
+    alert(`Sync staff selesai: ${result.data.synced || 0} karyawan.`);
   };
 
   const saveEmployee = () => {
@@ -1785,7 +1792,7 @@ function App() {
     setDatabaseOffline(false);
     setDatabaseMessage("");
     const summary = result.data.summary || {};
-    alert(`Migrasi selesai. Karyawan: ${summary.employees || 0}, absensi: ${summary.attendance || 0}, lembur/extra chore: ${summary.extraWork || 0}.`);
+    alert(`Migrasi selesai: ${summary.employees || 0} karyawan, ${summary.attendance || 0} absensi, Business Info ${summary.businessInfo ? "berhasil disinkronkan" : "tidak berubah"}.`);
   };
 
   const filteredSlips = store.saved_payslips.filter((slip) => {
@@ -1876,7 +1883,7 @@ function App() {
                 <Input label="Catatan" value={extraDraft.chore_notes} onChange={(v) => setExtraDraft({ ...extraDraft, chore_notes: v })} />
               </div>}
               <div className="actions">
-                <button className="primary" disabled={extraChoice === "none"} onClick={() => submitExtraWork(false)}><Save size={16} /> Kirim untuk Approval Admin</button>
+                <button className="primary" disabled={extraChoice === "none"} onClick={() => submitExtraWork(false)}><Save size={16} /> Kirim Catatan</button>
                 <button className="ghost" onClick={() => setShowExtraPrompt(null)}>Tutup</button>
               </div>
             </div>
@@ -1976,34 +1983,24 @@ function App() {
                   </div>
                 </div>
               )}
-              {isCheckInMode && qrValidationAttempted && !attendanceQrValid && !showManualQr && !adminCorrectionOpen && (
-                <div className="attendance-step invalid-qr-card">
-                  <div className="step-title"><span>1</span><h3>Validasi QR Kantor</h3></div>
-                  <span className="badge inactive">QR kantor tidak valid</span>
-                  <p className="error-text">QR kantor tidak valid. Silakan scan QR resmi dari kantor.</p>
-                </div>
-              )}
               {(attendanceCanContinue || showManualQr || adminCorrectionOpen) && <div className="attendance-step">
-                <div className="step-title"><span>1</span><h3>Validasi QR Kantor</h3></div>
+                <div className="step-title"><span>1</span><h3>Pilih Staff</h3></div>
                 <div className="status-row">
-                  <span className={`badge ${attendanceQrValid ? "active" : "inactive"}`}>{attendanceQrValid ? "QR Kantor valid" : "QR kantor tidak valid"}</span>
                   <span className={`badge ${locationState.status === "valid" || locationState.status === "not_configured" ? "active" : "pending"}`}>{locationState.message}</span>
                 </div>
                 <p className="muted">Tanggal Absensi: {today()} • Jam Sekarang: {clockNow.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" })}</p>
                 <p className="helper-text">Tanggal dan jam absensi otomatis mengikuti waktu saat staff clock in/out.</p>
                 {showManualQr && <div className="manual-qr-box">
-                  <label className="full">Input Manual<textarea placeholder="Office token / attendance link" value={attendanceQrInput} onChange={(e) => setAttendanceQrInput(e.target.value)} /></label>
+                  <label className="full">Tempel link absensi di sini<textarea placeholder="https://.../?attendance=staff" value={attendanceQrInput} onChange={(e) => setAttendanceQrInput(e.target.value)} /></label>
                   <p className="helper-text">Gunakan hanya jika scan QR tidak bisa digunakan.</p>
-                  <button className="primary" onClick={() => validateOfficeQr()}><QrCode size={16} /> Validasi QR</button>
+                  <button className="primary" onClick={openManualAttendanceLink}><QrCode size={16} /> Buka Link Absensi</button>
                 </div>}
                 {adminCorrectionOpen && <div className="warning-card">
                   <strong>Manual Admin Correction</strong>
                   <p className="muted">Khusus admin untuk koreksi darurat. Staff normal tidak perlu PIN admin.</p>
                   <input type="password" inputMode="numeric" placeholder="PIN Admin" value={manualAdminPin} onChange={(e) => setManualAdminPin(e.target.value)} />
                 </div>}
-              </div>}
-              {attendanceCanContinue && <div className="attendance-step">
-                <div className="step-title"><span>2</span><h3>Pilih Staff</h3></div>
+                {store.employees.filter((e) => e.active).length === 0 && <p className="warning-text">Belum ada data karyawan. Hubungi admin untuk sinkronisasi data karyawan.</p>}
                 <div className="form-grid">
                   <label>Pilih Nama Staff<select value={attendanceEmployee?.id || ""} onChange={(e) => {
                     const employee = store.employees.find((item) => item.id === e.target.value);
@@ -2012,26 +2009,31 @@ function App() {
                   <Input label="Atau masukkan Employee ID" value={attendanceEmployeeId} onChange={setAttendanceEmployeeId} />
                 </div>
                 {attendanceEmployee && <div className="confirm-card"><strong>{attendanceEmployee.name}</strong><span>{attendanceEmployee.employee_id} | {attendanceEmployee.status} | {attendanceEmployee.position}</span></div>}
+                {previousUnclosedAttendance && <p className="warning-text">Kemarin ada absensi yang belum Clock Out. Akan ditandai sebagai lupa sign out saat Clock In hari ini.</p>}
               </div>}
               {attendanceCanContinue && attendanceEmployee && <div className="attendance-step">
-                <div className="step-title"><span>3</span><h3>Masukkan PIN Staff</h3></div>
-                <div className="form-grid">
-                  <label>PIN Staff<input type="password" inputMode="numeric" placeholder="Masukkan PIN Staff" value={staffPinInput} onChange={(e) => setStaffPinInput(e.target.value)} /></label>
-                  <span className={`badge ${staffPinValid ? "active" : "inactive"}`}>{staffPinValid ? "PIN Staff valid" : "PIN Staff belum valid"}</span>
-                </div>
-              </div>}
-              {attendanceCanContinue && attendanceEmployee && <div className="attendance-step">
-                <div className="step-title"><span>4</span><h3>Absen</h3></div>
+                <div className="step-title"><span>2</span><h3>Absen</h3></div>
                 <div className="status-row">
                   {todayAttendance?.clock_in_time && <span className="badge pending">Sudah Clock In</span>}
                   {todayAttendance?.clock_out_time && <span className="badge approved">Sudah Clock Out</span>}
+                  {!todayAttendance && <span className="badge active">Belum absen hari ini</span>}
+                </div>
+                <div className="today-status">
+                  <span>Nama <strong>{attendanceEmployee.name}</strong></span>
+                  <span>ID <strong>{attendanceEmployee.employee_id}</strong></span>
+                  <span>Tanggal <strong>{today()}</strong></span>
+                  <span>Status <strong>{todayAttendance ? statusLabel(todayAttendance.status) : "Belum Clock In"}</strong></span>
+                  <span>Clock In <strong>{todayAttendance?.clock_in_time || "-"}</strong></span>
+                  <span>Clock Out <strong>{todayAttendance?.clock_out_time || "-"}</strong></span>
                 </div>
                 <div className="big-actions">
-                  <button className="primary" disabled={!attendanceReady || Boolean(todayAttendance?.clock_in_time)} onClick={clockIn}><Clock size={22} /> Clock In</button>
-                  <button className="primary dark" disabled={!attendanceReady || !todayAttendance?.clock_in_time || Boolean(todayAttendance?.clock_out_time)} onClick={clockOut}><Check size={22} /> Clock Out</button>
+                  {!todayAttendance?.clock_in_time && <button className="primary" disabled={!attendanceReady} onClick={clockIn}><Clock size={22} /> Clock In</button>}
+                  {todayAttendance?.clock_in_time && !todayAttendance.clock_out_time && <button className="primary dark" disabled={!attendanceReady} onClick={clockOut}><Check size={22} /> Clock Out</button>}
+                  {todayAttendance?.clock_in_time && todayAttendance.clock_out_time && <button className="ghost" disabled>Absensi hari ini sudah lengkap</button>}
                 </div>
+                {todayAttendance?.clock_in_time && todayAttendance.clock_out_time && <p className="helper-text">Jika ada kesalahan, hubungi admin.</p>}
               </div>}
-              {attendanceMessage && !(isCheckInMode && qrValidationAttempted && !attendanceQrValid && !showManualQr && !adminCorrectionOpen) && <p className={attendanceMessageIsError ? "error-text" : "success-text"}>{attendanceMessage}</p>}
+              {attendanceMessage && <p className={attendanceMessageIsError ? "error-text" : "success-text"}>{attendanceMessage}</p>}
               {todayAttendance && <div className="today-status">
                 <span>Clock in <strong>{todayAttendance.clock_in_time || "-"}</strong></span>
                 <span>Clock out <strong>{todayAttendance.clock_out_time || "-"}</strong></span>
@@ -2062,7 +2064,10 @@ function App() {
         {adminUnlocked && page === "Staff / Employee Settings" && (
           <section className="grid two">
             <div className="panel">
-              <h2>Data Karyawan</h2>
+              <div className="section-head">
+                <h2>Data Karyawan</h2>
+                <button className="ghost" onClick={syncStaffToNeon}><Upload size={16} /> Sync Staff ke Neon</button>
+              </div>
               <div className="form-grid">
                 <label>ID Karyawan<input readOnly value={draftEmployee.employee_id} /><span className="helper-text">ID otomatis, tidak perlu diisi manual.</span><span className="helper-text">Employee ID dibuat otomatis oleh sistem.</span></label>
                 <Input label="Nama" value={draftEmployee.name} onChange={(v) => setDraftEmployee({ ...draftEmployee, name: v })} />
@@ -2084,7 +2089,7 @@ function App() {
                 <Input label="Bank Name" value={draftEmployee.bank_name} onChange={(v) => setDraftEmployee({ ...draftEmployee, bank_name: v })} />
                 <Input label="Account Number" value={draftEmployee.account_number} onChange={(v) => setDraftEmployee({ ...draftEmployee, account_number: v })} />
                 <Input label="Account Holder" value={draftEmployee.account_holder} onChange={(v) => setDraftEmployee({ ...draftEmployee, account_holder: v })} />
-                <label>PIN Staff<input type="password" inputMode="numeric" value={draftEmployee.staff_pin} onChange={(e) => setDraftEmployee({ ...draftEmployee, staff_pin: e.target.value })} /><span className="helper-text">Absensi utama menggunakan QR Kantor / QR Harian + PIN Staff.</span></label>
+                <label>PIN Staff<input type="password" inputMode="numeric" value={draftEmployee.staff_pin} onChange={(e) => setDraftEmployee({ ...draftEmployee, staff_pin: e.target.value })} /><span className="helper-text">PIN staff disimpan untuk kebutuhan lanjutan, tidak dipakai untuk absensi saat ini.</span></label>
                 <button className="ghost" onClick={() => setDraftEmployee({ ...draftEmployee, staff_pin: randomPin() })}>Generate PIN</button>
                 <Toggle label="Aktif" checked={draftEmployee.active} onChange={(v) => setDraftEmployee({ ...draftEmployee, active: v })} />
                 <label className="full">Catatan<textarea value={draftEmployee.notes} onChange={(e) => setDraftEmployee({ ...draftEmployee, notes: e.target.value })} /></label>
@@ -2311,7 +2316,13 @@ function App() {
             </div>
             {settingsTab === "Info Bisnis" && (
               <div className="panel">
-                <h2>Info Bisnis</h2>
+                <div className="section-head">
+                  <h2>Info Bisnis</h2>
+                  <div className="actions">
+                    <button className="ghost" onClick={refreshBusinessFromDatabase}><RotateCcw size={16} /> Refresh dari Database</button>
+                    <button className="primary" onClick={syncBusinessInfo}><Upload size={16} /> Sync Business Info ke Neon</button>
+                  </div>
+                </div>
                 <div className="form-grid two-columns">
                   <Input label="Nama Bisnis" value={store.business_settings.business_name} onChange={(v) => updateBusiness({ business_name: v })} />
                   <Input label="Nama Legal Perusahaan" value={store.business_settings.legal_name} onChange={(v) => updateBusiness({ legal_name: v })} />
@@ -2350,7 +2361,7 @@ function App() {
                   {officeQrDataUrl ? <img src={officeQrDataUrl} alt="" /> : <span>Office QR Code akan tampil setelah Generate QR.</span>}
                 </div>
                 <p className="warning-text">Jika QR diregenerasi, QR lama yang sudah diprint tidak akan berlaku.</p>
-                <p className="helper-text">Print atau tampilkan QR ini di tablet/laptop kantor. Staff scan QR menggunakan HP masing-masing, lalu pilih nama dan masukkan PIN Staff.</p>
+                <p className="helper-text">Print atau tampilkan QR ini di tablet/laptop kantor. Staff scan QR menggunakan HP masing-masing, lalu pilih nama untuk absen.</p>
                 <p className="helper-text">Mode QR Kantor Statis cocok untuk penggunaan harian. QR cukup diprint satu kali dan ditempel di kantor. Saat staff scan, sistem otomatis mencatat tanggal, jam, dan lokasi staff jika validasi lokasi diaktifkan.</p>
                 <div className="inner-panel">
                   <h2>Validasi Lokasi</h2>

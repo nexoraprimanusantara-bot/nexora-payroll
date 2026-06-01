@@ -45,13 +45,30 @@ function attendanceSettingsFromDb(row) {
   };
 }
 
+function businessSettingsFromDb(row) {
+  return {
+    ...(row?.data || {}),
+    business_name: row?.business_name || row?.data?.business_name || "Nama Bisnis",
+    legal_name: row?.data?.legal_name || "",
+    address: row?.business_address || row?.data?.address || "",
+    phone: row?.business_phone || row?.data?.phone || "",
+    email: row?.business_email || row?.data?.email || "",
+    website: row?.data?.website || "",
+    logo_data_url: row?.business_logo_url || row?.data?.logo_data_url || "",
+    footer_note: row?.payslip_footer_note || row?.data?.footer_note || "",
+    payment_note: row?.data?.payment_note || "",
+    currency: row?.data?.currency || "IDR",
+    admin_pin: row?.data?.admin_pin || "0987",
+  };
+}
+
 export default async function handler(req, res) {
   if (req.method !== "GET") return methodNotAllowed(res);
   try {
     await ensureSchema();
     const sql = getSql();
     const [attendanceSettings] = await sql`select * from attendance_settings where id = 'default'`;
-    const [businessSettings] = await sql`select data from business_settings where id = 'default'`;
+    const [businessSettings] = await sql`select * from business_settings where id = 'default'`;
     const employees = await sql`select * from employees order by employee_id`;
     const attendanceLogs = await sql`select * from attendance_logs order by date desc, employee_name asc limit 1000`;
     const extraWork = await sql`select * from extra_work_records order by date desc, created_at desc limit 1000`;
@@ -65,7 +82,7 @@ export default async function handler(req, res) {
     return json(res, 200, {
       ok: true,
       business_settings: {
-        ...(businessSettings?.data || {}),
+        ...businessSettingsFromDb(businessSettings),
         ...attendanceSettingsFromDb(attendanceSettings),
       },
       employees: employees.map(employeeFromDb),

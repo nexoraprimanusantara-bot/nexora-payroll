@@ -53,10 +53,26 @@ export async function ensureSchema() {
     create table if not exists business_settings (
       id text primary key default 'default',
       data jsonb not null default '{}'::jsonb,
+      business_name text default 'Nama Bisnis',
+      business_subtitle text default 'Aplikasi Penggajian',
+      business_address text,
+      business_phone text,
+      business_email text,
+      business_logo_url text,
+      business_npwp text,
+      payslip_footer_note text,
       created_at timestamptz default now(),
       updated_at timestamptz default now()
     )
   `;
+  await sql`alter table business_settings add column if not exists business_name text default 'Nama Bisnis'`;
+  await sql`alter table business_settings add column if not exists business_subtitle text default 'Aplikasi Penggajian'`;
+  await sql`alter table business_settings add column if not exists business_address text`;
+  await sql`alter table business_settings add column if not exists business_phone text`;
+  await sql`alter table business_settings add column if not exists business_email text`;
+  await sql`alter table business_settings add column if not exists business_logo_url text`;
+  await sql`alter table business_settings add column if not exists business_npwp text`;
+  await sql`alter table business_settings add column if not exists payslip_footer_note text`;
   await sql`
     create table if not exists attendance_settings (
       id text primary key default 'default',
@@ -123,12 +139,20 @@ export async function ensureSchema() {
       office_distance_meters double precision,
       location_valid boolean,
       location_validation_status text,
+      forgot_clock_out boolean default false,
+      auto_closed_at timestamptz,
+      status_note text,
+      admin_review_required boolean default false,
       notes text,
       created_at timestamptz default now(),
       updated_at timestamptz default now(),
       unique (employee_id, date)
     )
   `;
+  await sql`alter table attendance_logs add column if not exists forgot_clock_out boolean default false`;
+  await sql`alter table attendance_logs add column if not exists auto_closed_at timestamptz`;
+  await sql`alter table attendance_logs add column if not exists status_note text`;
+  await sql`alter table attendance_logs add column if not exists admin_review_required boolean default false`;
   await sql`
     create table if not exists extra_work_records (
       id text primary key,
@@ -158,6 +182,11 @@ export async function ensureSchema() {
   await sql`
     insert into attendance_settings (id, office_token)
     values ('default', ${officeToken()})
+    on conflict (id) do nothing
+  `;
+  await sql`
+    insert into business_settings (id, business_name, business_subtitle)
+    values ('default', 'Nama Bisnis', 'Aplikasi Penggajian')
     on conflict (id) do nothing
   `;
 }

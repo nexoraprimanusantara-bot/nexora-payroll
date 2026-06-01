@@ -41,6 +41,17 @@ export async function saveAttendanceSettings(settings: Record<string, unknown>, 
   });
 }
 
+export async function fetchBusinessSettings() {
+  return apiFetch<Record<string, unknown>>("/api/business-settings");
+}
+
+export async function saveBusinessSettings(settings: Record<string, unknown>) {
+  return apiFetch<Record<string, unknown>>("/api/business-settings", {
+    method: "PUT",
+    body: JSON.stringify({ business_settings: settings }),
+  });
+}
+
 export async function saveEmployeeRemote(employee: Record<string, unknown>) {
   return apiFetch<Record<string, unknown>>("/api/employees", {
     method: "POST",
@@ -48,10 +59,10 @@ export async function saveEmployeeRemote(employee: Record<string, unknown>) {
   });
 }
 
-export async function validateOfficeQrRemote(officeToken: string) {
-  return apiFetch<{ ok: true; valid: boolean; qr_type: "office_static" | "daily" }>("/api/attendance/validate-office-qr", {
+export async function syncEmployeesRemote(employees: Array<Record<string, unknown>>) {
+  return apiFetch<{ ok: true; synced: number }>("/api/employees/sync", {
     method: "POST",
-    body: JSON.stringify({ officeToken }),
+    body: JSON.stringify({ employees }),
   });
 }
 
