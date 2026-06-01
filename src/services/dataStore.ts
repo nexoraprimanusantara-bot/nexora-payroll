@@ -31,68 +31,68 @@ export async function initDatabase() {
 
 export async function bootstrapData() {
   await initDatabase();
-  return apiFetch<Record<string, unknown>>("/api/bootstrap");
+  return apiFetch<Record<string, unknown>>("/api/app?action=bootstrap");
 }
 
 export async function saveAttendanceSettings(settings: Record<string, unknown>, regenerate = false) {
-  return apiFetch<Record<string, unknown>>("/api/attendance-settings", {
+  return apiFetch<Record<string, unknown>>("/api/app?action=attendance-settings", {
     method: "PUT",
     body: JSON.stringify({ ...settings, regenerate }),
   });
 }
 
 export async function fetchBusinessSettings() {
-  return apiFetch<Record<string, unknown>>("/api/business-settings");
+  return apiFetch<Record<string, unknown>>("/api/app?action=business-settings");
 }
 
 export async function saveBusinessSettings(settings: Record<string, unknown>) {
-  return apiFetch<Record<string, unknown>>("/api/business-settings", {
+  return apiFetch<Record<string, unknown>>("/api/app?action=business-settings", {
     method: "PUT",
     body: JSON.stringify({ business_settings: settings }),
   });
 }
 
 export async function saveEmployeeRemote(employee: Record<string, unknown>) {
-  return apiFetch<Record<string, unknown>>("/api/employees", {
+  return apiFetch<Record<string, unknown>>("/api/app?action=employee", {
     method: "POST",
     body: JSON.stringify({ employee }),
   });
 }
 
 export async function syncEmployeesRemote(employees: Array<Record<string, unknown>>) {
-  return apiFetch<{ ok: true; synced: number }>("/api/employees/sync", {
+  return apiFetch<{ ok: true; synced: number }>("/api/app?action=sync-employees", {
     method: "POST",
     body: JSON.stringify({ employees }),
   });
 }
 
 export async function clockAttendanceRemote(payload: Record<string, unknown>) {
-  return apiFetch<Record<string, unknown>>("/api/attendance/clock", {
+  return apiFetch<Record<string, unknown>>("/api/attendance?action=clock", {
     method: "POST",
     body: JSON.stringify(payload),
   });
 }
 
 export async function fetchTodayAttendance(date: string) {
-  return apiFetch<Record<string, unknown>>(`/api/attendance/today?date=${encodeURIComponent(date)}`);
+  return apiFetch<Record<string, unknown>>(`/api/attendance?action=today&date=${encodeURIComponent(date)}`);
 }
 
 export async function saveExtraWorkRemote(records: Array<Record<string, unknown>>) {
-  return apiFetch<Record<string, unknown>>("/api/extra-work", {
+  return apiFetch<Record<string, unknown>>("/api/attendance?action=extra-work", {
     method: "POST",
     body: JSON.stringify({ records }),
   });
 }
 
 export async function updateExtraWorkRemote(record: Record<string, unknown>) {
-  return apiFetch<Record<string, unknown>>(`/api/extra-work/${encodeURIComponent(String(record.id || ""))}`, {
+  return apiFetch<Record<string, unknown>>("/api/attendance?action=extra-work", {
     method: "PUT",
     body: JSON.stringify({ record }),
   });
 }
 
 export async function migrateLocalDataToNeon(store: Record<string, unknown>) {
-  return apiFetch<{ ok: true; summary: Record<string, number> }>("/api/migrate-local-data", {
+  return apiFetch<{ ok: true; summary: Record<string, number> }>("/api/app?action=migrate-local-data", {
     method: "POST",
     body: JSON.stringify({ store }),
   });
